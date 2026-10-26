@@ -46,38 +46,20 @@ info = {'CFBundleName':app_name, 'CFBundleDisplayName':app_name,
         'LSArchitecturePriority':[a.arch], 'LSMinimumSystemVersion':'11.0', 'NSHighResolutionCapable':True}
 (app/'Contents/Info.plist').write_bytes(plistlib.dumps(info))
 platform = 'Apple Silicon Mac（M 系列）' if a.arch == 'arm64' else 'Intel Mac'
-guide = f'''{app_name} v{a.version} — {platform}
+notes = f'''{app_name} v{a.version}
+適用：{platform}
 
-1. 完整解壓縮 ZIP，將「{app_name}.app」拖至「應用程式」。
-2. 雙擊 App；首次啟動會自動準備必要資源，完成後進入遊戲。
-3. 使用自己的台版摩爾莊園帳號登入。
+本版更新
+- 台版連線、銀行入口、游標與中文字型相容性調整。
+- 改善書籍排版、關閉崩潰與餐廳卡頓。
 
-不需要安裝 Rust、Java、Python 或 Flash。遊玩需要網路。
-本包只支援 {platform}，請選擇符合處理器的下載檔案。
-最低系統版本標記為 macOS 11；其他機型與系統版本的相容性仍待驗證。
+已知問題
+- 拜訪別人餐廳後返回自己餐廳，服務生可能在端菜時消失。
+- 《伊蓮小理財》的排版尚未處理。
 
-此為以 MoleRuffle／Ruffle 為基礎的非官方台版客戶端，非淘米官方產品。
-原專案：https://github.com/moleworld-dev/MoleRuffle
-本包不包含完整遊戲資源、開發者帳號、快取或遊玩日誌。
-遊戲內容仍由官方伺服器載入，相關權利歸原權利人所有。
-
-本版包含台版連線、銀行入口、游標、中文字型與書籍排版相容性修正，
-以及關閉流程與餐廳卡頓改善。程式使用台灣時區，不修改系統時區。
-已知問題：拜訪別人餐廳再回自己餐廳後，服務生可能在端菜途中消失。
-伊蓮小理財的排版暫未處理。本版仍可能有其他相容性問題。
-
-啟動失敗或遊戲意外結束時，可使用「重試」「開啟日誌」「關閉」。
-回報問題請提供操作步驟、地圖／小遊戲名稱，以及截圖或日誌；不要提供密碼。
-日誌可能含遊戲錯誤網址，分享前請檢查內容。
-
-App 有本機簽章，尚未經 Apple 公證。若 macOS 顯示安全警告，
-請確認下載來源，再依系統提示處理；不需要停用系統安全設定。
-
-為沿用既有設定，資料與日誌繼續使用下列位置：
-~/Library/Application Support/MoleRuffle-Taiwan-Test/
-請勿分享 SharedObjects（可能含記住的帳號）。
+非官方客戶端，尚未經 Apple 公證。
 '''
-(out/'開始使用.txt').write_text(guide, encoding='utf-8')
+(out/'發布說明.txt').write_text(notes, encoding='utf-8')
 licenses = res/'Licenses'
 licenses.mkdir()
 for name in ['LICENSE-MIT', 'LICENSE-APACHE']:
