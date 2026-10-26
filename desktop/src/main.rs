@@ -38,6 +38,7 @@ use winit::window::{Window, WindowId};
 use moleruffle_core as mole;
 
 mod keymap;
+mod task_executor;
 /// iOS 纯触摸复制/粘贴工具条(原生 UIView 叠层)。
 #[cfg(target_os = "ios")]
 mod ios_textbar;
@@ -48,14 +49,14 @@ mod ios_debug_hud;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
-    TaskPoll(async_task::Runnable),
+    TaskPoll,
 }
 
 /// Ruffle 的 `FutureSpawner`:把异步任务(网络 fetch、socket 等)
 /// 通过事件循环代理调度回主线程逐步 poll。
 #[derive(Clone)]
 struct MoleExecutor {
-    proxy: EventLoopProxy<UserEvent>,
+    spawner: task_executor::LocalSpawner,
 }
 
 impl<E: std::error::Error + 'static> FutureSpawner<E> for MoleExecutor {
@@ -65,18 +66,12 @@ impl<E: std::error::Error + 'static> FutureSpawner<E> for MoleExecutor {
                 tracing::error!("async task 出错: {e}");
             }
         };
-        let proxy = self.proxy.clone();
-        let schedule = move |runnable| {
-            let _ = proxy.send_event(UserEvent::TaskPoll(runnable));
-        };
-        let (runnable, task) = async_task::spawn_local(future, schedule);
-        task.detach();
-        runnable.schedule();
+        self.spawner.spawn(future);
     }
 }
 
 struct App {
-    proxy: EventLoopProxy<UserEvent>,
+    executor: task_executor::LocalExecutor,
     runtime: tokio::runtime::Runtime,
     window: Option<Arc<Window>>,
     player: Option<Arc<Mutex<Player>>>,
@@ -139,6 +134,13 @@ fn surface_dims(window: &Window) -> (u32, u32) {
 /// 故全平台统一 1.0 真高清。若极端机型仍紧,可临时降到 0.85(2438×1122,仍远超 960×560 源美术)。
 const RENDER_SCALE: f64 = 1.0;
 
+fn log_slow_ui_work(phase: &'static str, started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_millis(80) {
+        tracing::warn!(phase, elapsed_ms = elapsed.as_millis() as u64, "Slow UI work");
+    }
+}
+
 /// 自适应内存守卫阈值(iOS)。研究结论:~5GB 足迹里 ~3-4GB 是 Ruffle 不压缩的解码位图(动不了),
 /// ~1GB 是纹理池(只进不出累积,**唯一可回收的大头**)。故守卫=按"距 jetsam 墙余量"主动清纹理池:
 /// 余量本身已反映各设备墙高(iPhone 6143 / iPad 8191 / 老机型更低),同一套绝对阈值即自适应。
@@ -187,7 +189,9 @@ fn backend_str(b: wgpu::Backend) -> String {
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Self> {
         Ok(Self {
-            proxy,
+            executor: task_executor::LocalExecutor::new(move || {
+                let _ = proxy.send_event(UserEvent::TaskPoll);
+            }),
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?,
@@ -295,7 +299,7 @@ impl App {
             None,
             None,
             MoleExecutor {
-                proxy: self.proxy.clone(),
+                spawner: self.executor.spawner(),
             },
             None,
             false,
@@ -309,7 +313,21 @@ impl App {
         let navigator = mole::CachingNavigator::new(navigator, mole::cache_dir());
 
         // 设备字体后端:系统字体 + 中文回退;并取软键盘标志(文本框聚焦时弹键盘)
-        let ui = mole::MoleUiBackend::with_system_fonts();
+        let cursor_window = window.clone();
+        let visibility_window = window.clone();
+        let ui = mole::MoleUiBackend::with_system_fonts().with_mouse_handlers(
+            move |cursor| {
+                use ruffle_core::backend::ui::MouseCursor;
+                use winit::window::CursorIcon;
+                cursor_window.set_cursor(match cursor {
+                    MouseCursor::Arrow => CursorIcon::Default,
+                    MouseCursor::Hand => CursorIcon::Pointer,
+                    MouseCursor::IBeam => CursorIcon::Text,
+                    MouseCursor::Grab => CursorIcon::Grab,
+                });
+            },
+            move |visible| visibility_window.set_cursor_visible(visible),
+        );
         let kbd = ui.keyboard_flag();
         let mut builder = PlayerBuilder::new()
             .with_renderer(renderer)
@@ -463,8 +481,10 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _el: &ActiveEventLoop, event: UserEvent) {
         enter_runtime!(self);
         match event {
-            UserEvent::TaskPoll(runnable) => {
-                runnable.run();
+            UserEvent::TaskPoll => {
+                let started = Instant::now();
+                self.executor.poll();
+                log_slow_ui_work("async_tasks", started);
             }
         }
         // 异步任务(如 SWF 加载完成)后引导/维持 redraw 循环。
@@ -478,7 +498,12 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         enter_runtime!(self);
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                tracing::info!("Window close requested; cancelling local tasks on UI thread");
+                self.executor.shutdown();
+                self.player.take();
+                el.exit();
+            }
             WindowEvent::Resized(_size) => {
                 // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 render_dims(已降采样)。
                 if let Some(w) = &self.window {
@@ -524,7 +549,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 // 只渲染当前帧。tick 已移到 about_to_wait,按 SWF 帧率(摩尔庄园 ~24-30fps)推进,
                 // 且仅在 needs_render 时才会走到这里——不再按屏幕 60Hz 过度渲染,GPU/发热砍约一半。
+                let started = Instant::now();
                 self.with_player(|p| p.render());
+                log_slow_ui_work("render", started);
                 self.frames += 1;
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -667,6 +694,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        enter_runtime!(self);
+        self.executor.shutdown();
+        self.player.take();
+    }
+
     // 锁帧驱动:推进 tokio 异步 + 按 SWF 帧率 tick + 仅脏时请求重绘 + 睡到下一帧(渲染在 RedrawRequested 做)
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         enter_runtime!(self);
@@ -711,13 +744,18 @@ impl ApplicationHandler<UserEvent> for App {
         // 摩尔庄园 ~24-30fps,屏幕 60Hz 时这砍掉约一半 GPU/发热;挂机/对话框近乎 0 重绘。
         let now = Instant::now();
         let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
+        if dt_ms >= 250.0 {
+            tracing::warn!(elapsed_ms = dt_ms as u64, "UI frame gap");
+        }
         self.last_tick = now;
+        let started = Instant::now();
         let (needs_render, til) = self
             .with_player(|p| {
                 p.tick(FloatDuration::from_millis(dt_ms));
                 (p.needs_render(), p.time_til_next_frame())
             })
             .unwrap_or((false, Duration::from_millis(16)));
+        log_slow_ui_work("tick", started);
         if needs_render {
             if let Some(w) = &self.window {
                 w.request_redraw();
@@ -754,6 +792,12 @@ fn main() -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App::new(proxy)?;
-    event_loop.run_app(&mut app)?;
+    let result = event_loop.run_app(&mut app);
+    {
+        let _guard = app.runtime.enter();
+        app.executor.shutdown();
+        app.player.take();
+    }
+    result?;
     Ok(())
 }

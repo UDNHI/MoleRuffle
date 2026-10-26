@@ -20,25 +20,26 @@ use ruffle_core::backend::ui::{
 use ruffle_core::config::Letterbox;
 use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, StageScaleMode};
-use ruffle_render::quality::StageQuality;
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
+use ruffle_render::quality::StageQuality;
 use unic_langid::LanguageIdentifier;
 use url::Url;
 
 pub mod cache;
-pub use cache::{cache_dir, CachingNavigator};
+pub use cache::{CachingNavigator, cache_dir};
 pub mod mem;
+mod book_fonts;
 
 /// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
 /// 相对路径(version/、resource/、config/、dll/)都相对它来解析。
-pub const GAME_SWF_URL: &str = "http://mole.61.com/Client.swf";
+pub const GAME_SWF_URL: &str = "http://mole.61.com.tw/Client.swf";
 
-/// 所有相对 fetch 的 base，回源到 mole.61.com。
-pub const GAME_BASE_URL: &str = "http://mole.61.com/";
+/// 所有相对 fetch 的 base，回源到台版 mole.61.com.tw。
+pub const GAME_BASE_URL: &str = "http://mole.61.com.tw/";
 
 /// 窗口标题。
-pub const WINDOW_TITLE: &str = "摩尔庄园 · MoleRuffle";
+pub const WINDOW_TITLE: &str = "MoleRuffle 台版";
 
 /// 固定舞台尺寸(Client.swf 的逻辑尺寸)。
 pub const STAGE_WIDTH: u32 = 960;
@@ -106,6 +107,9 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
 /// `DiskStorageBackend` 会在此目录下按 `{host}/{swf}/{name}.sol` 落盘
 /// (摩尔庄园即 `mole.61.com/Client.swf/<名字>.sol`),目录不存在会自动创建。
 pub fn mole_storage_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("MOLERUFFLE_DATA_DIR") {
+        return PathBuf::from(dir).join("SharedObjects");
+    }
     let base = dirs::data_local_dir().unwrap_or_else(|| {
         // 极少数环境拿不到标准数据目录时,退到 HOME(再退到当前目录),保证仍是磁盘持久化。
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
@@ -142,9 +146,10 @@ pub fn set_mole_fonts(player: &mut Player) {
     player.set_default_font(
         DefaultFont::Sans,
         vec![
-            "PingFang SC".into(),       // macOS / iOS
-            "Microsoft YaHei".into(),   // Windows
-            "Noto Sans CJK SC".into(),  // Linux / Android
+            "PingFang TC".into(),
+            "PingFang SC".into(),      // macOS / iOS
+            "Microsoft YaHei".into(),  // Windows
+            "Noto Sans CJK SC".into(), // Linux / Android
             "Source Han Sans SC".into(),
             "Heiti SC".into(),
             "Arial".into(),
@@ -153,6 +158,7 @@ pub fn set_mole_fonts(player: &mut Player) {
     player.set_default_font(
         DefaultFont::Serif,
         vec![
+            "Songti TC".into(),
             "Songti SC".into(),
             "SimSun".into(),
             "Noto Serif CJK SC".into(),
@@ -162,6 +168,7 @@ pub fn set_mole_fonts(player: &mut Player) {
     player.set_default_font(
         DefaultFont::Typewriter,
         vec![
+            "PingFang TC".into(),
             "PingFang SC".into(),
             "Noto Sans CJK SC".into(),
             "Courier New".into(),
@@ -205,9 +212,12 @@ impl NavigatorInterface for MoleNavigatorInterface {
 /// 设备字体回退顺序:任何字体名都先试精确匹配,失败再依次退到这些
 /// “一定带中文”的字体,保证摩尔庄园的动态文本(玩家名/聊天/系统提示)能显示中文。
 const FONT_FALLBACKS: &[&str] = &[
-    "PingFang SC",       // macOS / iOS
-    "Microsoft YaHei",   // Windows
-    "Noto Sans CJK SC",  // Linux / Android
+    "PingFang TC",
+    "Microsoft JhengHei",
+    "Noto Sans CJK TC",
+    "PingFang SC",      // macOS / iOS
+    "Microsoft YaHei",  // Windows
+    "Noto Sans CJK SC", // Linux / Android
     "Source Han Sans SC",
     "Heiti SC",
     "STHeiti",
@@ -215,12 +225,9 @@ const FONT_FALLBACKS: &[&str] = &[
     "Hiragino Sans GB",
 ];
 
-/// 打包进二进制的中文+拉丁兜底字体:**PingFang SC Regular(苹方,iOS 原生高清字体)** 子集
-/// (ASCII+标点+全部常用汉字 U+4E00-9FFF+假名,CFF 轮廓,~8.5MB)。iOS 真机沙盒读不到系统
-/// 中文字体(/System/Library/Fonts/Core 不可读)、fontdb 按名查 PingFang 全失败时用它兜底,
-/// 保证动态文本(玩家名/聊天/输入)不缺字且是 iOS 原生观感。ttf_parser 0.25 的 outline_glyph
-/// 支持 CFF;`include_bytes!` 编进 .rodata,`FontFileData::new(BUNDLED_FONT)` 对 &'static 零拷贝。
-const BUNDLED_FONT: &[u8] = include_bytes!("../assets/molefont.ttf");
+/// Redistributable Traditional Chinese fallback (Noto Sans TC, SIL OFL 1.1).
+/// System fonts remain preferred; see assets/NOTO-OFL.txt for the bundled license.
+const BUNDLED_FONT: &[u8] = include_bytes!("../assets/notosanstc.ttf");
 
 /// MoleRuffle 的 `UiBackend`。
 ///
@@ -230,6 +237,9 @@ const BUNDLED_FONT: &[u8] = include_bytes!("../assets/molefont.ttf");
 /// 其余方法全部 no-op(本客户端不需要剪贴板/对话框等)。
 #[derive(Clone)]
 pub struct MoleUiBackend {
+    cursor_handler: Option<Arc<dyn Fn(MouseCursor) + Send + Sync>>,
+    visibility_handler: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    mouse_visible: bool,
     fonts: Arc<fontdb::Database>,
     /// 应用内剪贴板兜底(移动端无系统剪贴板时用;桌面也作镜像)。
     clip: Arc<std::sync::Mutex<String>>,
@@ -258,10 +268,24 @@ impl MoleUiBackend {
         }
         tracing::info!("MoleUiBackend: 载入 {} 个字体面", db.len());
         Self {
+            cursor_handler: None,
+            visibility_handler: None,
+            mouse_visible: true,
             fonts: Arc::new(db),
             clip: Arc::new(std::sync::Mutex::new(String::new())),
             kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Connect Flash cursor requests to the platform window.
+    pub fn with_mouse_handlers(
+        mut self,
+        cursor: impl Fn(MouseCursor) + Send + Sync + 'static,
+        visibility: impl Fn(bool) + Send + Sync + 'static,
+    ) -> Self {
+        self.cursor_handler = Some(Arc::new(cursor));
+        self.visibility_handler = Some(Arc::new(visibility));
+        self
     }
 
     /// 平台壳取这个标志:为 true 时该弹软键盘(set_ime_allowed(true)),false 时收起。
@@ -310,6 +334,23 @@ impl MoleUiBackend {
 
 impl UiBackend for MoleUiBackend {
     fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
+        // Book aliases are introduced only in selected book responses. Ordinary
+        // UI font names keep the fallback policy used before the book fixes.
+        if let Some(families) = book_fonts::families(&query.name) {
+            for family in families {
+                if self.try_register(family, query, register) {
+                    return;
+                }
+            }
+        }
+        // Flash dynamically creates Latin-named fields containing Chinese.
+        if ["Times New Roman", "Times", "Arial", "Helvetica", "Tahoma", "Verdana"]
+            .iter().any(|name| query.name.eq_ignore_ascii_case(name))
+        {
+            for family in ["PingFang TC", "Microsoft JhengHei", "Noto Sans CJK TC"] {
+                if self.try_register(family, query, register) { return; }
+            }
+        }
         // 1) 先按游戏请求的确切字体名找
         if self.try_register(&query.name, query, register) {
             return;
@@ -337,10 +378,19 @@ impl UiBackend for MoleUiBackend {
     }
 
     fn mouse_visible(&self) -> bool {
-        true
+        self.mouse_visible
     }
-    fn set_mouse_visible(&mut self, _visible: bool) {}
-    fn set_mouse_cursor(&mut self, _cursor: MouseCursor) {}
+    fn set_mouse_visible(&mut self, visible: bool) {
+        self.mouse_visible = visible;
+        if let Some(handler) = &self.visibility_handler {
+            handler(visible);
+        }
+    }
+    fn set_mouse_cursor(&mut self, cursor: MouseCursor) {
+        if let Some(handler) = &self.cursor_handler {
+            handler(cursor);
+        }
+    }
     fn clipboard_content(&mut self) -> String {
         // 桌面:读系统剪贴板(arboard);iOS:读系统剪贴板(UIPasteboard);
         // 都失败/Android:用应用内兜底。
@@ -402,9 +452,12 @@ impl UiBackend for MoleUiBackend {
         self.kbd.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     fn language(&self) -> LanguageIdentifier {
-        "zh-CN".parse().expect("合法 language id")
+        "zh-TW".parse().expect("合法 language id")
     }
-    fn display_file_open_dialog(&mut self, _filters: Vec<FileFilter>) -> Option<DialogResultFuture> {
+    fn display_file_open_dialog(
+        &mut self,
+        _filters: Vec<FileFilter>,
+    ) -> Option<DialogResultFuture> {
         None
     }
     fn display_file_open_dialog_multiple(
@@ -427,8 +480,8 @@ impl UiBackend for MoleUiBackend {
 /// `clipboard_content` 优先返回它,从而绕过 iOS16+ 对程序化读剪贴板的隐私拦截(不弹窗)。
 #[cfg(target_os = "ios")]
 pub mod paste_bridge {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     static BUF: Mutex<Option<String>> = Mutex::new(None);
     static PENDING: AtomicBool = AtomicBool::new(false);

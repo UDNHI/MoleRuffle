@@ -1,9 +1,9 @@
-//! 本地资源缓存(CDN 思路):把摩尔庄园从 mole.61.com 流式拉取的**静态资源**
+//! 本地资源缓存(CDN 思路):把摩尔庄园从 台版服务器流式拉取的**静态资源**
 //! (几百个 SWF / 图片)缓存到磁盘。二次加载直接读本地——秒开、且不依赖网络,
-//! 缓解 mole.61.com 慢/抖动导致的资源拉取失败("可能服务器在维护")与每次重下的低效。
+//! 缓解台版资源服务器慢/抖动导致的资源拉取失败("可能服务器在维护")与每次重下的低效。
 //!
 //! 实现:包一层 [`CachingNavigator`] 在 `ExternalNavigatorBackend` 外面,只重写 `fetch`:
-//!   - 可缓存(GET、无 body、host=mole.61.com、无 query/非动态)→ 命中读盘、未命中走内层
+//!   - 可缓存(GET、无 body、台版资源 host、无 query、静态资源扩展名)→ 命中读盘、未命中走内层
 //!     网络后存盘;只缓存 HTTP 200。
 //!   - 其余(登录 account.61.com / POST / socket)原样透传给内层,绝不缓存动态内容。
 //!
@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use encoding_rs::Encoding;
@@ -57,17 +57,34 @@ impl<N> CachingNavigator<N> {
     }
 }
 
-/// 哪些请求可缓存:GET + 无 body + 静态资源主机 + 无 query/非动态脚本。
-/// 登录/会话(account.61.com、带 ? 的动态、.php 等)一律不缓存,避免拿到陈旧的动态响应。
+/// GET + no body + static host; query URLs are excluded except for the two
+/// versioned waiter animations. Login/session and dynamic scripts never cache.
+fn is_restaurant_animation(url: &str) -> bool {
+    Url::parse(url).is_ok_and(|url| {
+        url.host_str() == Some("mole.61.com.tw")
+            && matches!(url.path(), "/resource/petcloth/swf2/1200042.swf" | "/resource/petcloth/swf2/1200043.swf")
+    })
+}
+
 fn is_cacheable(req: &Request) -> bool {
     if req.method() != NavigationMethod::Get || req.body().is_some() {
         return false;
     }
-    let url = req.url();
-    url.contains("mole.61.com")
-        && !url.contains('?')
-        && !url.contains(".php")
-        && !url.contains(".jsp")
+    let Ok(url) = Url::parse(req.url()) else {
+        return false;
+    };
+    let static_host = matches!(
+        url.host_str(),
+        Some("mole.61.com.tw" | "rsyncgametest.61.com.tw")
+    );
+    let path = url.path().to_ascii_lowercase();
+    static_host
+        // Only these two static animations may cache versioned requests.
+        // The full URL remains the key, so different versions stay separate.
+        && (url.query().is_none() || is_restaurant_animation(req.url()))
+        && [".swf", ".png", ".jpg", ".jpeg", ".gif", ".mp3"]
+            .iter()
+            .any(|extension| path.ends_with(extension))
 }
 
 fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
@@ -81,20 +98,45 @@ fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
     }
 }
 
-impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
-    fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+impl<N: NavigatorBackend> CachingNavigator<N> {
+    fn fetch_original(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
         // 非 GET(POST 等)不幂等:既不缓存也不重试,原样透传(重试 POST 会重复提交)。
         if request.method() != NavigationMethod::Get {
             return self.inner.borrow().fetch(request);
         }
 
+        // Opt-in local compatibility patch for the six bank game buttons only.
+        // Resolve relative requests; accept no other host, asset or HTTP method.
+        if let Ok(resolved) = self.inner.borrow().resolve_url(request.url()) {
+            if resolved.host_str() == Some("mole.61.com.tw")
+                && resolved.path() == "/resource/map/69.swf"
+            {
+                if let Some(path) = std::env::var_os("MOLERUFFLE_BANK_SWF") {
+                    match std::fs::read(path) {
+                        Ok(bytes) if bytes.starts_with(b"CWS") || bytes.starts_with(b"FWS") => {
+                            tracing::info!("Using bank trace compatibility patch");
+                            return Box::pin(async move {
+                                Ok(Box::new(CachedResponse::new(resolved.to_string(), bytes))
+                                    as Box<dyn SuccessResponse>)
+                            });
+                        }
+                        _ => tracing::warn!("Bank patch unavailable; using original server asset"),
+                    }
+                }
+            }
+        }
+
         let url = request.url().to_string();
+        let restaurant_animation = is_restaurant_animation(&url);
         let cacheable = is_cacheable(&request);
         let cache_path = cacheable.then(|| self.cache_path(&url));
 
         // 缓存命中:直接读盘返回(免网络,秒开)
         if let Some(path) = &cache_path {
             if let Ok(bytes) = std::fs::read(path) {
+                if restaurant_animation {
+                    tracing::info!("Restaurant animation cache hit: {url}");
+                }
                 tracing::debug!("缓存命中: {url}");
                 let u = url.clone();
                 return Box::pin(async move {
@@ -113,6 +155,7 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                 let mut req = Request::get(url.clone());
                 req.set_headers(headers.clone());
                 // 借用只在同步的 fetch() 调用期间持有,拿到 future 后立刻释放,绝不跨 await
+                let started = Instant::now();
                 let fut = inner.borrow().fetch(req);
                 match fut.await {
                     Ok(resp) => {
@@ -125,6 +168,10 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                         let final_url = resp.url().to_string();
                         match resp.body().await {
                             Ok(bytes) => {
+                                if restaurant_animation {
+                                    tracing::info!(request_ms = started.elapsed().as_millis() as u64,
+                                        bytes = bytes.len(), "Restaurant animation downloaded: {url}");
+                                }
                                 write_cache_atomic(path, &bytes);
                                 tracing::debug!("缓存写入: {url} ({} 字节)", bytes.len());
                                 return Ok(Box::new(CachedResponse::new(final_url, bytes))
@@ -150,6 +197,31 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                     }
                 }
             }
+        })
+    }
+
+}
+
+impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
+    fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        let patch_book = request.method() == NavigationMethod::Get
+            && request.body().is_none()
+            && self.inner.borrow().resolve_url(request.url()).is_ok_and(|url| crate::book_fonts::applies(&url));
+        let future = self.fetch_original(request);
+        if !patch_book { return future; }
+        Box::pin(async move {
+            let response = future.await?;
+            if response.status() != 200 { return Ok(response); }
+            let url = response.url().to_string();
+            let bytes = response.body().await.map_err(|error| ErrorResponse { url: url.clone(), error })?;
+            let bytes = if let Some(patched) = crate::book_fonts::patch(&bytes) {
+                tracing::info!("Applied book-only font aliases: {url}");
+                patched
+            } else {
+                tracing::warn!("No book font aliases needed; keeping original resource: {url}");
+                bytes
+            };
+            Ok(Box::new(CachedResponse::new(url, bytes)) as Box<dyn SuccessResponse>)
         })
     }
 
@@ -200,7 +272,11 @@ struct CachedResponse {
 
 impl CachedResponse {
     fn new(url: String, bytes: Vec<u8>) -> Self {
-        Self { url, bytes, chunk_done: false }
+        Self {
+            url,
+            bytes,
+            chunk_done: false,
+        }
     }
 }
 
@@ -247,9 +323,64 @@ impl SuccessResponse for CachedResponse {
 
 /// 资源缓存目录:各端缓存目录下 MoleRuffle/http(iOS=沙盒 Library/Caches/MoleRuffle/http)。
 pub fn cache_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("MOLERUFFLE_DATA_DIR") {
+        return PathBuf::from(dir).join("http");
+    }
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("MoleRuffle")
         .join("http")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_excludes_sessions_and_unrelated_hosts() {
+        for url in [
+            "http://mole.61.com.tw/Client.swf?session=secret",
+            "http://mole.61.com.tw/config/Server.xml",
+            "http://mole.61.com.tw/version/zzz_config.txt",
+            "http://mole.61.com.tw.example.org/Client.swf",
+            "http://example.org/mole.61.com.tw/Client.swf",
+            "http://mole.61.com/Client.swf",
+        ] {
+            assert!(!is_cacheable(&Request::get(url.into())), "{url}");
+        }
+        assert!(!is_cacheable(&Request::post(
+            "http://mole.61.com.tw/Client.swf".into(),
+            None,
+        )));
+    }
+
+    #[test]
+    fn cache_accepts_taiwan_static_assets() {
+        for url in [
+            "http://mole.61.com.tw/Client.swf",
+            "http://rsyncgametest.61.com.tw/mole/resource/map.swf",
+            "http://mole.61.com.tw/resource/logo.png",
+        ] {
+            assert!(is_cacheable(&Request::get(url.into())), "{url}");
+        }
+    }
+
+    #[test]
+    fn versioned_waiter_animations_cache_by_complete_url() {
+        let a = "http://mole.61.com.tw/resource/petcloth/swf2/1200042.swf?v=1";
+        let b = "http://mole.61.com.tw/resource/petcloth/swf2/1200042.swf?v=2";
+        assert!(is_cacheable(&Request::get(a.into())));
+        assert!(is_cacheable(&Request::get(b.into())));
+        assert!(is_cacheable(&Request::get("http://mole.61.com.tw/resource/petcloth/swf2/1200043.swf?version".into())));
+        // Check the actual cache key without creating a cache directory.
+        let cache = CachingNavigator { inner: Rc::new(RefCell::new(())), cache_dir: PathBuf::from("unused") };
+        assert_ne!(cache.cache_path(a), cache.cache_path(b));
+        for url in [
+            "http://mole.61.com.tw/resource/petcloth/swf2/1200044.swf?v=1",
+            "http://mole.61.com.tw/resource/map/69.swf?v=1",
+            "http://example.com/resource/petcloth/swf2/1200042.swf?v=1",
+        ] { assert!(!is_cacheable(&Request::get(url.into()))); }
+        assert!(!is_cacheable(&Request::post(a.into(), None)));
+    }
 }

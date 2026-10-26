@@ -261,12 +261,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-task"
-version = "4.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b75356056920673b02621b35afd0f7dda9306d03c79a30f5c56c44cf256e3de"
-
-[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2438,6 +2432,7 @@ dependencies = [
  "async-channel",
  "dirs",
  "encoding_rs",
+ "flate2",
  "fontdb",
  "indexmap",
  "objc2-foundation 0.2.2",
@@ -2455,7 +2450,6 @@ name = "moleruffle-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-task",
  "futures",
  "moleruffle-core",
  "objc2 0.5.2",

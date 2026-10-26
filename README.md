@@ -1,67 +1,26 @@
-# MoleRuffle
+# MoleRuffle 台版
 
-[![平台](https://img.shields.io/badge/平台-Windows_·_macOS_·_Linux_·_Android_·_iOS-4c8bf5?style=flat-square)](#)
-[![引擎 Ruffle](https://img.shields.io/badge/引擎-Ruffle-f28f1c?style=flat-square)](https://github.com/ruffle-rs/ruffle)
-[![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue?style=flat-square)](#license)
-[![官网](https://img.shields.io/badge/官网-moleworld.net-2ea44f?style=flat-square)](https://moleworld.net)
+基於 [MoleRuffle](https://github.com/moleworld-dev/MoleRuffle) 與 [Ruffle](https://github.com/ruffle-rs/ruffle) 的非官方客戶端，讓 Apple Silicon（M 系列）Mac 連線遊玩台版摩爾莊園。
 
-专为 **摩尔庄园网页版**(`mole.61.com`)量身定制的跨平台原生客户端,基于 [Ruffle](https://github.com/ruffle-rs/ruffle) 引擎,用 Rust 编写。
+目前版本：**v0.1.9**
 
-目标:**Windows / macOS / Linux / Android / iOS** 五端,开箱即在线进入游戏,高性能、原生体验。
+## 使用方式
 
-> 这是一个面向小规模分发的个人/同好项目。客户端只是“引擎 + 装配”;摩尔庄园的美术资源与服务器属于上海淘米,本仓库不分发任何游戏资源,运行时由客户端直接从官方地址加载。
+下載 macOS App 後完整解壓縮，將「MoleRuffle 台版.app」放入「應用程式」，雙擊啟動並登入台版帳號。首次啟動會自動準備必要資源，不需要另外安裝 Flash。
 
-## 为什么可行(已实测)
+App 採本機簽章，尚未經 Apple 公證。
 
-把 Ruffle 桌面引擎钉在 commit `304a3c9d`,直接喂 `http://mole.61.com/Client.swf`:
+## 已知問題
 
-- ✅ 成功进入游戏世界(渲染主城、坐骑、其他在线玩家)
-- ✅ **原生 TCP** 连真实服务器 `123.206.131.236:1865` / `:3200`,收发二进制游戏协议(登录 Session、进入地图、走路、防沉迷计时)
-- ✅ 91 个资源 SWF 在线加载成功,仅 1 个非致命 AVM2 错误,9.5 分钟零崩
+- 拜訪別人餐廳後返回自己餐廳，服務生可能在端菜時消失。
+- 《伊蓮小理財》的文字排版尚未處理。
 
-关键三点(全部固化进 `moleruffle-core`):
+## 版本紀錄
 
-| 命门 | 解法 |
-|---|---|
-| `Client.swf` 脱离官网会 `navigateToURL` 弹回首页 | `with_spoofed_url` 伪装 SWF 自身 URL,破域名守卫 |
-| 游戏靠裸 TCP 连服务器(浏览器/WASM 做不到) | 原生 `ExternalNavigatorBackend` + `SocketMode::Allow` |
-| 相对资源路径要回源 | `base_url = http://mole.61.com/` |
+請見 [台版版本紀錄](docs/TAIWAN.md)。
 
-> iOS/Android 同理用**原生**栈(非 WASM),裸 TCP 可直接用;详见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
+## 來源與授權
 
-## 结构
+台版修改由 UDNHI 維護。原專案來自 [moleworld-dev/MoleRuffle](https://github.com/moleworld-dev/MoleRuffle)，引擎使用 [Ruffle](https://github.com/ruffle-rs/ruffle)；程式碼採 MIT OR Apache-2.0，詳見儲存庫內授權文件。
 
-```
-MoleRuffle/
-├── crates/moleruffle-core/   # 五端共享:摩尔庄园配置 + Player 装配 + spoof + socket 放行 + 中文字体
-├── desktop/                  # Win/macOS/Linux 壳(winit + wgpu)  →  binary: moleruffle
-├── android/                  # Android 壳(fork 官方 ruffle-android,真机已出登录界面,打磨中)
-├── ios/                      # iOS 壳(已实装:xcodeproj + 自签/TestFlight 脚本,内部测试中)
-└── docs/ARCHITECTURE.md
-```
-
-## 构建 & 运行(桌面)
-
-```bash
-cargo run --release -p moleruffle-desktop
-# 或
-cargo build --release -p moleruffle-desktop && ./target/release/moleruffle
-```
-
-首次构建会从 GitHub 拉取并编译 Ruffle 引擎(数分钟)。运行后窗口直接加载摩尔庄园登录页,用淘米账号登录即可进入游戏。
-
-## 路线图
-
-- [x] **Phase 0** — 验证 Ruffle 能在线跑通摩尔庄园(macOS 桌面,已实测)
-- [x] **Phase 1** — macOS 薄壳(已跑通:窗口直接加载登录页,`cargo run` 即玩)
-- [~] **Phase 2** — Android:fork 官方 ruffle-android,真机已出登录界面,横屏/中文字体/收键盘打磨中
-- [ ] **Phase 3** — Windows + Linux 平移
-- [~] **Phase 4** — iOS:原生壳已实装(wgpu/Metal + 自签/TestFlight),内部测试中
-- [ ] **Phase 5** — 全玩法点亮(钓鱼/卡丁车/小屋…)+ 中文字体内置 + 回归加固
-
-> 图例:`[x]` 已完成 · `[~]` 进行中 · `[ ]` 待办
-
-## License
-
-引擎与本壳代码遵循 `MIT OR Apache-2.0`(同 Ruffle)。游戏内容版权归上海淘米所有,本仓库不含任何游戏资源。
+本專案非淘米官方產品，不包含完整遊戲資源；遊戲內容由官方伺服器載入，相關權利歸原權利人所有。
