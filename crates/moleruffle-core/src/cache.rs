@@ -3,15 +3,14 @@
 //! 缓解台版资源服务器慢/抖动导致的资源拉取失败("可能服务器在维护")与每次重下的低效。
 //!
 //! 实现:包一层 [`CachingNavigator`] 在 `ExternalNavigatorBackend` 外面,只重写 `fetch`:
-//!   - 可缓存(GET、无 body、台版资源 host、无 query、静态资源扩展名)→ 命中读盘、未命中走内层
-//!     网络后存盘;只缓存 HTTP 200。
+//!   - 可缓存(规则见 [`cache_policy`])→ 命中读盘、未命中走内层网络后存盘;
+//!     只缓存 HTTP 200 且档头像资源档的回应。
 //!   - 其余(登录 account.61.com / POST / socket)原样透传给内层,绝不缓存动态内容。
 //!
 //! socket(游戏服 123.206.131.236:1865 的实时协议)走 `connect_socket`,天然不经此缓存。
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,43 +78,93 @@ impl<N> CachingNavigator<N> {
         }
     }
 
-    /// URL → 缓存文件路径(对完整 URL 取稳定 hash,按前两位分桶,避免单目录文件过多)。
+    /// URL → 缓存文件路径(对完整 URL 取 FNV-1a hash,按前两位分桶,避免单目录文件过多)。
     fn cache_path(&self, url: &str) -> PathBuf {
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        url.hash(&mut h);
-        let hex = format!("{:016x}", h.finish());
+        let hex = format!("{:016x}", fnv1a64(url.as_bytes()));
         self.cache_dir.join(&hex[0..2]).join(format!("{hex}.swfcache"))
     }
 }
 
-/// GET + no body + static host; query URLs are excluded except for the two
-/// versioned waiter animations. Login/session and dynamic scripts never cache.
-fn is_restaurant_animation(url: &str) -> bool {
-    Url::parse(url).is_ok_and(|url| {
-        url.host_str() == Some("mole.61.com.tw")
-            && matches!(url.path(), "/resource/petcloth/swf2/1200042.swf" | "/resource/petcloth/swf2/1200043.swf")
-    })
+/// 快取规则(一律对 resolve 后的绝对 URL 判断;游戏常用相对路径,直接 parse 会失败而漏掉):
+/// - 只缓存 GET、无 body、台版资源 host、静态资源扩展名(SWF/图片/MP3)。
+/// - 入口 `Client.swf` 不缓存:服务器更新时必须拿到新版。
+/// - 带查询字串时,只接受游戏版本管理器加的版本号(档案修改时间的 36 进位,如 `?i1hkoxuw`)。
+///   档案一更新版本号就变,所以按完整 URL 永久缓存是安全的。带 `&`、`=` 或纯数字
+///   (`&123` 之类的随机防快取参数)的一律不缓存。两个服务生动画例外,任何查询都可缓存。
+/// - 没有版本号的资源只缓存 [`UNVERSIONED_TTL`],过期就重新下载,避免服务器更新后一直用旧档。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CachePolicy {
+    /// 不缓存。
+    None,
+    /// URL 带版本号,永久有效。
+    Versioned,
+    /// 没有版本号,只在 [`UNVERSIONED_TTL`] 内有效。
+    Unversioned,
 }
 
-fn is_cacheable(req: &Request) -> bool {
-    if req.method() != NavigationMethod::Get || req.body().is_some() {
-        return false;
+/// 没有版本号的资源在缓存里能用多久。够一次长时间游玩反复载入,又不至于一直用旧档。
+const UNVERSIONED_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn is_restaurant_animation(url: &Url) -> bool {
+    url.host_str() == Some("mole.61.com.tw")
+        && matches!(url.path(), "/resource/petcloth/swf2/1200042.swf" | "/resource/petcloth/swf2/1200043.swf")
+}
+
+/// 游戏版本管理器(`TaomeeVersionManager.getVerURLByNameSpace`)加的版本号:
+/// 档案修改时间 `toString(36)`,目前是 8 个小写英数字。
+fn is_version_token(query: &str) -> bool {
+    (5..=12).contains(&query.len())
+        && query.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        && query.bytes().any(|c| c.is_ascii_lowercase())
+}
+
+fn cache_policy(method: NavigationMethod, has_body: bool, url: &Url) -> CachePolicy {
+    if method != NavigationMethod::Get || has_body {
+        return CachePolicy::None;
     }
-    let Ok(url) = Url::parse(req.url()) else {
-        return false;
-    };
-    let static_host = matches!(
-        url.host_str(),
-        Some("mole.61.com.tw" | "rsyncgametest.61.com.tw")
-    );
+    let static_host = matches!(url.host_str(), Some("mole.61.com.tw" | "rsyncgametest.61.com.tw"));
     let path = url.path().to_ascii_lowercase();
-    static_host
-        // Only these two static animations may cache versioned requests.
-        // The full URL remains the key, so different versions stay separate.
-        && (url.query().is_none() || is_restaurant_animation(req.url()))
-        && [".swf", ".png", ".jpg", ".jpeg", ".gif", ".mp3"]
-            .iter()
-            .any(|extension| path.ends_with(extension))
+    let static_asset = [".swf", ".png", ".jpg", ".jpeg", ".gif", ".mp3"]
+        .iter()
+        .any(|extension| path.ends_with(extension));
+    if !static_host || !static_asset || path.ends_with("/client.swf") {
+        return CachePolicy::None;
+    }
+    match url.query() {
+        None => CachePolicy::Unversioned,
+        Some(query) if is_version_token(query) || is_restaurant_animation(url) => CachePolicy::Versioned,
+        Some(_) => CachePolicy::None,
+    }
+}
+
+/// 写入快取前检查档头,避免把服务器维护时回 200 的 HTML 错误页永久缓存。
+fn looks_like_asset(bytes: &[u8]) -> bool {
+    const MAGIC: &[&[u8]] = &[
+        b"FWS", b"CWS", b"ZWS", // SWF
+        b"\x89PNG", b"\xFF\xD8\xFF", b"GIF8", // PNG / JPEG / GIF
+        b"ID3", b"\xFF\xFB", b"\xFF\xF3", b"\xFF\xF2", b"\xFF\xFA", // MP3
+    ];
+    MAGIC.iter().any(|magic| bytes.starts_with(magic))
+}
+
+/// 缓存档是否还能用(没版本号的资源看修改时间是否超过 TTL)。
+fn cache_entry_fresh(path: &std::path::Path, policy: CachePolicy) -> bool {
+    match policy {
+        CachePolicy::None => false,
+        CachePolicy::Versioned => true,
+        CachePolicy::Unversioned => std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < UNVERSIONED_TTL),
+    }
+}
+
+/// FNV-1a 64 位元。跟 `DefaultHasher` 不同,演算法固定,升级 Rust 后缓存路径不会变。
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
@@ -160,22 +209,27 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
             }
         }
 
-        let url = request.url().to_string();
-        let restaurant_animation = is_restaurant_animation(&url);
-        let cacheable = is_cacheable(&request);
-        let cache_path = cacheable.then(|| self.cache_path(&url));
+        // 一律用 resolve 后的绝对 URL 判断与当缓存键(游戏常给相对路径)。
+        let resolved = self.inner.borrow().resolve_url(request.url()).ok();
+        let url = resolved.as_ref().map_or_else(|| request.url().to_string(), Url::to_string);
+        let policy = resolved.as_ref().map_or(CachePolicy::None, |resolved| {
+            cache_policy(request.method(), request.body().is_some(), resolved)
+        });
+        let restaurant_animation = resolved.as_ref().is_some_and(is_restaurant_animation);
+        let cache_path = (policy != CachePolicy::None).then(|| self.cache_path(&url));
 
         // 缓存命中:直接读盘返回(免网络,秒开)
         if let Some(path) = &cache_path {
-            if let Ok(bytes) = std::fs::read(path) {
-                if restaurant_animation {
-                    tracing::info!("Restaurant animation cache hit: {url}");
+            if cache_entry_fresh(path, policy) {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if restaurant_animation {
+                        tracing::info!("Restaurant animation cache hit: {url}");
+                    }
+                    let u = url.clone();
+                    return (FetchSource::CacheHit, Box::pin(async move {
+                        Ok(Box::new(CachedResponse::new(u, bytes)) as Box<dyn SuccessResponse>)
+                    }));
                 }
-                tracing::debug!("缓存命中: {url}");
-                let u = url.clone();
-                return (FetchSource::CacheHit, Box::pin(async move {
-                    Ok(Box::new(CachedResponse::new(u, bytes)) as Box<dyn SuccessResponse>)
-                }));
             }
         }
 
@@ -207,8 +261,12 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                                     tracing::info!(request_ms = started.elapsed().as_millis() as u64,
                                         bytes = bytes.len(), "Restaurant animation downloaded: {url}");
                                 }
-                                write_cache_atomic(path, &bytes);
-                                tracing::debug!("缓存写入: {url} ({} 字节)", bytes.len());
+                                if looks_like_asset(&bytes) {
+                                    write_cache_atomic(path, &bytes);
+                                } else {
+                                    // 例:version/version*.swf 其实是游戏自订的压缩格式,每次启动都会碰到。
+                                    tracing::info!("回应不像资源档,不写入缓存: {url}");
+                                }
                                 return Ok(Box::new(CachedResponse::new(final_url, bytes))
                                     as Box<dyn SuccessResponse>);
                             }
@@ -382,50 +440,98 @@ pub fn cache_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn get(url: &str) -> CachePolicy {
+        cache_policy(NavigationMethod::Get, false, &Url::parse(url).unwrap())
+    }
+
     #[test]
-    fn cache_excludes_sessions_and_unrelated_hosts() {
+    fn cache_excludes_sessions_entry_and_unrelated_hosts() {
         for url in [
+            "http://mole.61.com.tw/Client.swf",
+            "http://mole.61.com.tw/Client.swf?i1hkoxuw",
             "http://mole.61.com.tw/Client.swf?session=secret",
             "http://mole.61.com.tw/config/Server.xml",
             "http://mole.61.com.tw/version/zzz_config.txt",
-            "http://mole.61.com.tw.example.org/Client.swf",
-            "http://example.org/mole.61.com.tw/Client.swf",
-            "http://mole.61.com/Client.swf",
+            "http://mole.61.com.tw.example.org/resource/a.swf",
+            "http://example.org/mole.61.com.tw/resource/a.swf",
+            "http://mole.61.com/resource/a.swf",
         ] {
-            assert!(!is_cacheable(&Request::get(url.into())), "{url}");
+            assert_eq!(get(url), CachePolicy::None, "{url}");
         }
-        assert!(!is_cacheable(&Request::post(
-            "http://mole.61.com.tw/Client.swf".into(),
-            None,
-        )));
+        let url = Url::parse("http://mole.61.com.tw/resource/a.swf").unwrap();
+        assert_eq!(cache_policy(NavigationMethod::Post, false, &url), CachePolicy::None);
+        assert_eq!(cache_policy(NavigationMethod::Get, true, &url), CachePolicy::None);
     }
 
     #[test]
-    fn cache_accepts_taiwan_static_assets() {
+    fn version_tokens_cache_permanently_random_queries_never() {
         for url in [
-            "http://mole.61.com.tw/Client.swf",
+            "http://mole.61.com.tw/resource/farm/Animal/swf/1270027.swf?i1hkoxuw",
+            "http://mole.61.com.tw/module/home/home.swf?i0zz9a1b",
+            "http://mole.61.com.tw/resource/petcloth/swf2/1200042.swf?v=1",
+            "http://mole.61.com.tw/resource/petcloth/swf2/1200043.swf?version",
+        ] {
+            assert_eq!(get(url), CachePolicy::Versioned, "{url}");
+        }
+        for url in [
+            "http://mole.61.com.tw/resource/a.swf?i1hkoxuw&512",
+            "http://mole.61.com.tw/resource/a.swf?512",
+            "http://mole.61.com.tw/resource/a.swf?1700000000",
+            "http://mole.61.com.tw/resource/a.swf?v=1",
+            "http://mole.61.com.tw/resource/a.swf?I1HKOXUW",
+            "http://mole.61.com.tw/resource/map/69.swf?v=1",
+        ] {
+            assert_eq!(get(url), CachePolicy::None, "{url}");
+        }
+    }
+
+    #[test]
+    fn unversioned_assets_cache_with_ttl() {
+        for url in [
+            "http://mole.61.com.tw/resource/restaurant/swf/1340012.swf",
             "http://rsyncgametest.61.com.tw/mole/resource/map.swf",
             "http://mole.61.com.tw/resource/logo.png",
         ] {
-            assert!(is_cacheable(&Request::get(url.into())), "{url}");
+            assert_eq!(get(url), CachePolicy::Unversioned, "{url}");
+        }
+        let dir = std::env::temp_dir().join(format!("moleruffle-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entry");
+        assert!(!cache_entry_fresh(&path, CachePolicy::Unversioned), "missing file is stale");
+        std::fs::write(&path, b"CWS").unwrap();
+        assert!(cache_entry_fresh(&path, CachePolicy::Unversioned));
+        assert!(cache_entry_fresh(&path, CachePolicy::Versioned));
+        assert!(!cache_entry_fresh(&path, CachePolicy::None));
+        let old = std::time::SystemTime::now() - UNVERSIONED_TTL - Duration::from_secs(60);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
+        assert!(!cache_entry_fresh(&path, CachePolicy::Unversioned), "expired");
+        assert!(cache_entry_fresh(&path, CachePolicy::Versioned), "versioned never expires");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_real_assets_are_written() {
+        for bytes in [&b"CWS\x0a"[..], b"FWS", b"ZWS", b"\x89PNG\r\n", b"\xFF\xD8\xFF\xE0", b"GIF89a", b"ID3\x03", b"\xFF\xFB\x90"] {
+            assert!(looks_like_asset(bytes), "{bytes:?}");
+        }
+        for bytes in [&b"<html>maintenance"[..], b"<?xml", b"", b"CW"] {
+            assert!(!looks_like_asset(bytes), "{bytes:?}");
         }
     }
 
     #[test]
-    fn versioned_waiter_animations_cache_by_complete_url() {
+    fn cache_key_is_stable_and_complete() {
+        let cache = CachingNavigator { inner: Rc::new(RefCell::new(())), cache_dir: PathBuf::from("unused") };
         let a = "http://mole.61.com.tw/resource/petcloth/swf2/1200042.swf?v=1";
         let b = "http://mole.61.com.tw/resource/petcloth/swf2/1200042.swf?v=2";
-        assert!(is_cacheable(&Request::get(a.into())));
-        assert!(is_cacheable(&Request::get(b.into())));
-        assert!(is_cacheable(&Request::get("http://mole.61.com.tw/resource/petcloth/swf2/1200043.swf?version".into())));
-        // Check the actual cache key without creating a cache directory.
-        let cache = CachingNavigator { inner: Rc::new(RefCell::new(())), cache_dir: PathBuf::from("unused") };
         assert_ne!(cache.cache_path(a), cache.cache_path(b));
-        for url in [
-            "http://mole.61.com.tw/resource/petcloth/swf2/1200044.swf?v=1",
-            "http://mole.61.com.tw/resource/map/69.swf?v=1",
-            "http://example.com/resource/petcloth/swf2/1200042.swf?v=1",
-        ] { assert!(!is_cacheable(&Request::get(url.into()))); }
-        assert!(!is_cacheable(&Request::post(a.into(), None)));
+        // FNV-1a 的标准测试值,确保演算法固定不变。
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(
+            cache.cache_path("http://mole.61.com.tw/a.swf"),
+            PathBuf::from("unused").join(format!("{:016x}", fnv1a64(b"http://mole.61.com.tw/a.swf"))[0..2].to_string())
+                .join(format!("{:016x}.swfcache", fnv1a64(b"http://mole.61.com.tw/a.swf")))
+        );
     }
 }
