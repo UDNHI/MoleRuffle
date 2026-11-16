@@ -1,5 +1,6 @@
 //! 运行时内存观测(主要给 iOS):看 app 实际内存足迹 + 距 jetsam 内存墙还剩多少余量。
-//! 桌面端无 jetsam 墙,两个函数都返回 None(调用方据此跳过)。
+//! `available_mb` 只在 iOS 有意义(桌面端无 jetsam 墙,返回 None);
+//! `footprint_mb` 在 iOS 与 macOS 都可用(macOS 用于长时间游玩的内存观测),其他平台返回 None。
 //!
 //! - [`available_mb`]:`os_proc_available_memory()`——本进程被 jetsam 杀掉前还能再用多少字节。
 //!   这是 Apple 官方"距内存墙余量"API,**会自动反映 increased-memory-limit entitlement 抬高后的新上限**,
@@ -7,12 +8,16 @@
 //! - [`footprint_mb`]:`task_vm_info.phys_footprint`——与 Xcode/Jetsam 完全同口径的内存足迹
 //!   (常驻 + 压缩 + IOKit),即 JetsamEvent 里那个被拿来跟上限比较的 rpages 折算值。
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 mod imp {
-    // 三个符号都由 libSystem 导出,声明即用,无需额外链接指令。
+    // 符号都由 libSystem 导出,声明即用,无需额外链接指令。
+    #[cfg(target_os = "ios")]
     unsafe extern "C" {
         /// 本进程距 per-app 内存上限还剩多少字节(0 = 不可用/不支持)。
         fn os_proc_available_memory() -> usize;
+    }
+
+    unsafe extern "C" {
         /// 当前 mach task 端口。C 里 `mach_task_self()` 是读这个全局的宏。
         static mach_task_self_: u32;
         fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
@@ -47,9 +52,15 @@ mod imp {
         phys_footprint: u64,
     }
 
+    #[cfg(target_os = "ios")]
     pub fn available_mb() -> Option<u64> {
         let b = unsafe { os_proc_available_memory() };
         (b != 0).then(|| b as u64 / (1024 * 1024))
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    pub fn available_mb() -> Option<u64> {
+        None
     }
 
     pub fn footprint_mb() -> Option<u64> {
@@ -67,7 +78,7 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 mod imp {
     pub fn available_mb() -> Option<u64> {
         None

@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
@@ -25,6 +26,36 @@ use ruffle_core::backend::navigator::{
 use ruffle_core::loader::Error;
 use ruffle_core::socket::{SocketAction, SocketHandle};
 use url::{ParseError, Url};
+
+/// 每个请求的流水号,方便在日志里把 start/end 两行对起来。
+static NEXT_FETCH_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 请求从哪里拿到资料(记日志用)。
+#[derive(Clone, Copy)]
+enum FetchSource {
+    /// 非 GET,原样透传。
+    Passthrough,
+    /// 银行补丁(本机文件)。
+    BankPatch,
+    /// 磁盘缓存命中。
+    CacheHit,
+    /// 可缓存但未命中,走网络后写入缓存。
+    CacheMiss,
+    /// 不可缓存的 GET,走网络(含重试)。
+    Network,
+}
+
+impl FetchSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::BankPatch => "bank_patch",
+            Self::CacheHit => "cache_hit",
+            Self::CacheMiss => "cache_miss",
+            Self::Network => "network",
+        }
+    }
+}
 
 /// 失败重试次数(总尝试 = RETRIES + 1)。只对幂等 GET 生效。抖动网络下瞬时超时重试一次往往就成。
 const RETRIES: u32 = 2;
@@ -87,6 +118,28 @@ fn is_cacheable(req: &Request) -> bool {
             .any(|extension| path.ends_with(extension))
 }
 
+/// 书籍资源:把回应内容换成套用书籍字型别名后的版本(只对 `book_fonts::applies` 的网址)。
+fn patch_book_response(
+    future: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>,
+) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+    Box::pin(async move {
+        let response = future.await?;
+        if response.status() != 200 {
+            return Ok(response);
+        }
+        let url = response.url().to_string();
+        let bytes = response.body().await.map_err(|error| ErrorResponse { url: url.clone(), error })?;
+        let bytes = if let Some(patched) = crate::book_fonts::patch(&bytes) {
+            tracing::info!("Applied book-only font aliases: {url}");
+            patched
+        } else {
+            tracing::warn!("No book font aliases needed; keeping original resource: {url}");
+            bytes
+        };
+        Ok(Box::new(CachedResponse::new(url, bytes)) as Box<dyn SuccessResponse>)
+    })
+}
+
 fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -99,10 +152,13 @@ fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
 }
 
 impl<N: NavigatorBackend> CachingNavigator<N> {
-    fn fetch_original(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+    fn fetch_original(
+        &self,
+        request: Request,
+    ) -> (FetchSource, OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>) {
         // 非 GET(POST 等)不幂等:既不缓存也不重试,原样透传(重试 POST 会重复提交)。
         if request.method() != NavigationMethod::Get {
-            return self.inner.borrow().fetch(request);
+            return (FetchSource::Passthrough, self.inner.borrow().fetch(request));
         }
 
         // Opt-in local compatibility patch for the six bank game buttons only.
@@ -115,10 +171,10 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                     match std::fs::read(path) {
                         Ok(bytes) if bytes.starts_with(b"CWS") || bytes.starts_with(b"FWS") => {
                             tracing::info!("Using bank trace compatibility patch");
-                            return Box::pin(async move {
+                            return (FetchSource::BankPatch, Box::pin(async move {
                                 Ok(Box::new(CachedResponse::new(resolved.to_string(), bytes))
                                     as Box<dyn SuccessResponse>)
-                            });
+                            }));
                         }
                         _ => tracing::warn!("Bank patch unavailable; using original server asset"),
                     }
@@ -139,16 +195,17 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                 }
                 tracing::debug!("缓存命中: {url}");
                 let u = url.clone();
-                return Box::pin(async move {
+                return (FetchSource::CacheHit, Box::pin(async move {
                     Ok(Box::new(CachedResponse::new(u, bytes)) as Box<dyn SuccessResponse>)
-                });
+                }));
             }
         }
 
         // 未命中:走网络。GET 幂等,失败/超时重试 RETRIES 次;成功且可缓存(200)则存盘。
+        let source = if cache_path.is_some() { FetchSource::CacheMiss } else { FetchSource::Network };
         let inner = self.inner.clone();
         let headers = request.headers().clone();
-        Box::pin(async move {
+        (source, Box::pin(async move {
             let mut attempt = 0u32;
             loop {
                 // 每次尝试重建一个 GET 请求(原请求已被上一次 fetch 消费)
@@ -197,31 +254,45 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                     }
                 }
             }
-        })
+        }))
     }
 
 }
 
 impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
+    /// 每个请求记两行 info 日志(target `moleruffle_core::net`):
+    /// `Fetch start`(发出时)与 `Fetch end`(拿到回应或失败时),以同一个 `id` 对应。
+    /// `url` 是 resolve 后的完整网址;`bytes` 是回应声明的长度(网络串流时为 Content-Length)。
+    /// 用来看每次卡顿/服务生消失前后到底在载什么、有没有命中缓存、两次载入是否重叠。
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        let id = NEXT_FETCH_ID.fetch_add(1, Ordering::Relaxed);
+        let resolved = self.inner.borrow().resolve_url(request.url());
+        let url = resolved
+            .as_ref()
+            .map(|url| url.to_string())
+            .unwrap_or_else(|_| request.url().to_string());
         let patch_book = request.method() == NavigationMethod::Get
             && request.body().is_none()
-            && self.inner.borrow().resolve_url(request.url()).is_ok_and(|url| crate::book_fonts::applies(&url));
-        let future = self.fetch_original(request);
-        if !patch_book { return future; }
+            && resolved.is_ok_and(|url| crate::book_fonts::applies(&url));
+        let (source, future) = self.fetch_original(request);
+        tracing::info!(target: "moleruffle_core::net", id, source = source.as_str(), "Fetch start {url}");
+        let started = Instant::now();
+        let future = if patch_book { patch_book_response(future) } else { future };
         Box::pin(async move {
-            let response = future.await?;
-            if response.status() != 200 { return Ok(response); }
-            let url = response.url().to_string();
-            let bytes = response.body().await.map_err(|error| ErrorResponse { url: url.clone(), error })?;
-            let bytes = if let Some(patched) = crate::book_fonts::patch(&bytes) {
-                tracing::info!("Applied book-only font aliases: {url}");
-                patched
-            } else {
-                tracing::warn!("No book font aliases needed; keeping original resource: {url}");
-                bytes
-            };
-            Ok(Box::new(CachedResponse::new(url, bytes)) as Box<dyn SuccessResponse>)
+            let result = future.await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match &result {
+                Ok(response) => {
+                    let bytes = response.expected_length().ok().flatten();
+                    tracing::info!(target: "moleruffle_core::net", id, source = source.as_str(),
+                        status = response.status(), elapsed_ms, bytes, "Fetch end {url}");
+                }
+                Err(error) => {
+                    tracing::info!(target: "moleruffle_core::net", id, source = source.as_str(),
+                        elapsed_ms, error = ?error.error, "Fetch failed {url}");
+                }
+            }
+            result
         })
     }
 

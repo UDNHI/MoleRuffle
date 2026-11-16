@@ -151,6 +151,10 @@ const MEM_SOFT_FLOOR_MB: u64 = 1500;
 #[cfg(target_os = "ios")]
 const MEM_URGENT_MB: u64 = 700;
 
+/// 桌面端记录内存足迹的间隔。
+#[cfg(not(target_os = "ios"))]
+const MEM_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
 /// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
 /// 否则重蹈"viewport 与触摸坐标空间不一致 → 触摸偏移"的坑。
@@ -791,6 +795,15 @@ impl ApplicationHandler<UserEvent> for App {
             if since.as_millis() >= 500 {
                 self.last_mem_check = now;
                 self.mem_hud_tick(since);
+            }
+        }
+
+        // 桌面端内存观测:每 30 秒记一笔 phys_footprint,用来看长时间游玩时内存怎么涨。
+        #[cfg(not(target_os = "ios"))]
+        if self.last_mem_check.elapsed() >= MEM_LOG_INTERVAL {
+            self.last_mem_check = now;
+            if let Some(mb) = mole::mem::footprint_mb() {
+                tracing::info!(footprint_mb = mb, frames = self.frames, "Memory footprint");
             }
         }
 
