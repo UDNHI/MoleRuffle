@@ -30,6 +30,7 @@ pub mod cache;
 pub use cache::{CachingNavigator, cache_dir};
 pub mod mem;
 mod book_fonts;
+mod simsun_compat;
 
 /// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
 /// 相对路径(version/、resource/、config/、dll/)都相对它来解析。
@@ -341,6 +342,26 @@ impl UiBackend for MoleUiBackend {
                 if self.try_register(family, query, register) {
                     return;
                 }
+            }
+        }
+        // SimSun / 宋体(游戏九成以上的文本框):用行高与 SimSun 一致的字体,避免固定文本框溢出。
+        if simsun_compat::is_simsun(&query.name) {
+            for family in simsun_compat::SYSTEM_FAMILIES {
+                if self.try_register(family, query, register) {
+                    tracing::info!("字体 '{}' 用 SimSun 相容字体 '{}'", query.name, family);
+                    return;
+                }
+            }
+            if let Some(data) = simsun_compat::bundled(BUNDLED_FONT) {
+                register(FontDefinition::FontFile {
+                    name: query.name.clone(),
+                    is_bold: query.is_bold,
+                    is_italic: query.is_italic,
+                    data: FontFileData::new(data),
+                    index: 0,
+                });
+                tracing::info!("字体 '{}' 用改成 SimSun 行高的打包字体", query.name);
+                return;
             }
         }
         // Flash dynamically creates Latin-named fields containing Chinese.

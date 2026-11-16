@@ -2441,6 +2441,7 @@ dependencies = [
  "ruffle_frontend_utils",
  "ruffle_render",
  "tracing",
+ "ttf-parser",
  "unic-langid",
  "url",
 ]

@@ -23,6 +23,10 @@ encoding_rs = "0.8"
 indexmap = "2"
 async-channel = "2"
 
+[dev-dependencies]
+# 测试改写后的字体仍可解析(与 fontdb 用的同一版本)
+ttf-parser = "0.25"
+
 # 系统剪贴板(复制粘贴)。桌面用 arboard。
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 arboard = "3"
