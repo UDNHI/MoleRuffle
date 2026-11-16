@@ -357,17 +357,14 @@ impl MoleUiBackend {
 
 /// 英文名字型里的中文要退到哪些字型(依序)。`None` = 不是这类字型。
 /// 主字型用真正的英文字型(行高也照它),中文字形由这里的字型补上,与 Windows 的字型链接相同。
+/// 游戏原本在简体中文 Windows 上制作,那里 Arial/Tahoma 的中文会链接到 SimSun,
+/// 所以一律退到宋体,书里“宋体框”和“Arial 框”的中文才会一致(如《伊蓮小理財》)。
 fn latin_cjk_fallbacks(family: &str) -> Option<&'static [&'static str]> {
-    const SANS: &[&str] = &["Heiti TC", "PingFang TC", "Microsoft JhengHei", "Noto Sans CJK TC"];
-    const SERIF: &[&str] = &["SimSong", "STSong", "Songti TC", "Noto Serif CJK TC"];
-    let is = |names: &[&str]| names.iter().any(|n| family.eq_ignore_ascii_case(n));
-    if is(&["Arial", "Helvetica", "Tahoma", "Verdana"]) {
-        Some(SANS)
-    } else if is(&["Times New Roman", "Times"]) {
-        Some(SERIF)
-    } else {
-        None
-    }
+    const SONG: &[&str] = &["SimSong", "STSong", "Songti TC", "Noto Serif CJK TC"];
+    ["Arial", "Helvetica", "Tahoma", "Verdana", "Times New Roman", "Times"]
+        .iter()
+        .any(|n| family.eq_ignore_ascii_case(n))
+        .then_some(SONG)
 }
 
 impl UiBackend for MoleUiBackend {
@@ -375,7 +372,8 @@ impl UiBackend for MoleUiBackend {
         // 文本框可能用嵌入字体的名字(如 "Arial_14pt_st")却以设备字体渲染,先去掉尺寸后缀。
         let family = simsun_compat::base_family(&query.name);
         // SimSun / 宋体(游戏九成以上的文本框):用行高与 SimSun 一致的字体,避免固定文本框溢出。
-        if simsun_compat::is_simsun(family) {
+        // 英文名字型(Arial…)一般走 `sort_device_fonts`;系统没有该英文字型时才到这里,同样用宋体。
+        if simsun_compat::is_simsun(family) || latin_cjk_fallbacks(family).is_some() {
             for family in simsun_compat::SYSTEM_FAMILIES {
                 if self.try_register(family, query, register) {
                     tracing::info!("字体 '{}' 用 SimSun 相容字体 '{}'", query.name, family);
@@ -392,15 +390,6 @@ impl UiBackend for MoleUiBackend {
                 });
                 tracing::info!("字体 '{}' 用改成 SimSun 行高的打包字体", query.name);
                 return;
-            }
-        }
-        // Flash dynamically creates Latin-named fields containing Chinese.
-        // Heiti TC 的行高与 SimSun 相同(1.00 em),优先于 PingFang TC(1.40 em)。
-        if ["Times New Roman", "Times", "Arial", "Helvetica", "Tahoma", "Verdana", "_sans"]
-            .iter().any(|name| family.eq_ignore_ascii_case(name))
-        {
-            for family in ["Heiti TC", "PingFang TC", "Microsoft JhengHei", "Noto Sans CJK TC"] {
-                if self.try_register(family, query, register) { return; }
             }
         }
         // 1) 先按游戏请求的确切字体名找
@@ -637,14 +626,14 @@ mod font_tests {
 
     #[test]
     fn latin_names_choose_matching_cjk_style() {
-        assert_eq!(latin_cjk_fallbacks("Arial").unwrap()[0], "Heiti TC");
-        assert_eq!(latin_cjk_fallbacks("tahoma").unwrap()[0], "Heiti TC");
+        assert_eq!(latin_cjk_fallbacks("Arial").unwrap()[0], "SimSong");
+        assert_eq!(latin_cjk_fallbacks("tahoma").unwrap()[0], "SimSong");
         assert_eq!(latin_cjk_fallbacks("Times New Roman").unwrap()[0], "SimSong");
         assert!(latin_cjk_fallbacks("SimSun").is_none());
         assert!(latin_cjk_fallbacks("Gulim").is_none());
     }
 
-    /// 用这台 Mac 的真实系统字体:Arial 当主字型、中文退到黑体,且非英文名不走排序。
+    /// 用这台 Mac 的真实系统字体:Arial 当主字型、中文退到 SimSong,且非英文名不走排序。
     #[cfg(target_os = "macos")]
     #[test]
     fn latin_font_gets_real_font_plus_cjk_fallback() {
@@ -659,7 +648,7 @@ mod font_tests {
             }
         });
         let names: Vec<_> = sorted.iter().map(|q| q.name.as_str()).collect();
-        assert_eq!(names, ["Arial_14pt_st", "MoleRuffle CJK: Heiti TC"]);
+        assert_eq!(names, ["Arial_14pt_st", "MoleRuffle CJK: SimSong"]);
         assert_eq!(registered[0], ("Arial_14pt_st".to_owned(), false), "main font is the real Arial");
         assert!(registered[1].1, "fallback has Chinese glyphs");
 
