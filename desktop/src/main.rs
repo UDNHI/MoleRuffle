@@ -357,6 +357,30 @@ impl App {
         (player, kbd, render_api)
     }
 
+    /// 快速退出:先隐藏窗口、把 SharedObject(“记住账号”等)写盘、在 UI 线程取消本地任务,
+    /// 然后直接结束进程,由操作系统一次回收内存。
+    ///
+    /// 不再 drop Player:玩得越久 Player 里累积的对象越多,逐个析构会让关窗卡住
+    /// (实测 25 分钟 ≈ 11 秒、54 分钟 ≈ 76 秒)。Player 的 Drop 本来只额外做
+    /// `flush_shared_objects`,这里已手动调用。
+    ///
+    /// `executor.shutdown()` 仍在 UI 线程执行,保证 !Send future 在所属线程上 drop(v0.1.7 的修正)。
+    fn quit_now(&mut self) -> ! {
+        if let Some(w) = &self.window {
+            w.set_visible(false);
+        }
+
+        let started = Instant::now();
+        self.with_player(|p| p.flush_shared_objects());
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "SharedObjects flushed");
+
+        let started = Instant::now();
+        self.executor.shutdown();
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Local tasks cancelled; exiting");
+
+        std::process::exit(0);
+    }
+
     fn with_player<R>(&self, f: impl FnOnce(&mut Player) -> R) -> Option<R> {
         let player = self.player.as_ref()?;
         let mut guard = player.lock().expect("player lock");
@@ -495,14 +519,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         enter_runtime!(self);
         match event {
             WindowEvent::CloseRequested => {
-                tracing::info!("Window close requested; cancelling local tasks on UI thread");
-                self.executor.shutdown();
-                self.player.take();
-                el.exit();
+                tracing::info!("Window close requested");
+                self.quit_now();
             }
             WindowEvent::Resized(_size) => {
                 // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 render_dims(已降采样)。
@@ -696,8 +718,8 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         enter_runtime!(self);
-        self.executor.shutdown();
-        self.player.take();
+        // 例如 macOS 的 Cmd+Q:同样走快速退出,不在主线程逐个析构 Player。
+        self.quit_now();
     }
 
     // 锁帧驱动:推进 tokio 异步 + 按 SWF 帧率 tick + 仅脏时请求重绘 + 睡到下一帧(渲染在 RedrawRequested 做)
