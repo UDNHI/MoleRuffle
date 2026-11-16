@@ -20,11 +20,25 @@ const DESCENT_RATIO: f64 = 36.0 / 256.0;
 /// 依序尝试的 SimSun 相容系统字体。
 pub(crate) const SYSTEM_FAMILIES: &[&str] = &["SimSong", "STSong"];
 
-/// 游戏请求的字体名是否属于 SimSun 家族。
+/// 游戏请求的字体名是否属于 SimSun 家族(`_serif` 在中文 Windows 上也是宋体)。
 pub(crate) fn is_simsun(name: &str) -> bool {
-    ["SimSun", "NSimSun", "宋体", "宋體", "新宋体", "新宋體"]
+    ["SimSun", "NSimSun", "宋体", "宋體", "新宋体", "新宋體", "_serif"]
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
+}
+
+/// 去掉 Flash 静态文本嵌入字体名的尺寸后缀:"Arial_14pt_st" → "Arial"。
+/// 这类名字有时被文本框当设备字体用(如《伊蓮小理財》)。
+pub(crate) fn base_family(name: &str) -> &str {
+    if let Some((family, size)) = name.strip_suffix("_st").and_then(|s| s.rsplit_once('_')) {
+        if size
+            .strip_suffix("pt")
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+        {
+            return family;
+        }
+    }
+    name
 }
 
 /// 打包字体改成 SimSun 行高后的版本(只算一次,之后共用)。改写失败则为 None。
@@ -126,5 +140,15 @@ mod tests {
         assert!(is_simsun("宋体"));
         assert!(!is_simsun("SimHei"));
         assert!(!is_simsun("Tahoma"));
+    }
+
+    #[test]
+    fn static_text_suffix_is_stripped() {
+        assert_eq!(base_family("Arial_14pt_st"), "Arial");
+        assert_eq!(base_family("宋体_14pt_st"), "宋体");
+        assert_eq!(base_family("Times New Roman_14pt_st"), "Times New Roman");
+        assert_eq!(base_family("SimSun"), "SimSun");
+        assert_eq!(base_family("Foo_pt_st"), "Foo_pt_st");
+        assert_eq!(base_family("Foo_bar_st"), "Foo_bar_st");
     }
 }

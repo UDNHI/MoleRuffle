@@ -118,28 +118,6 @@ fn is_cacheable(req: &Request) -> bool {
             .any(|extension| path.ends_with(extension))
 }
 
-/// 书籍资源:把回应内容换成套用书籍字型别名后的版本(只对 `book_fonts::applies` 的网址)。
-fn patch_book_response(
-    future: OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>,
-) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-    Box::pin(async move {
-        let response = future.await?;
-        if response.status() != 200 {
-            return Ok(response);
-        }
-        let url = response.url().to_string();
-        let bytes = response.body().await.map_err(|error| ErrorResponse { url: url.clone(), error })?;
-        let bytes = if let Some(patched) = crate::book_fonts::patch(&bytes) {
-            tracing::info!("Applied book-only font aliases: {url}");
-            patched
-        } else {
-            tracing::warn!("No book font aliases needed; keeping original resource: {url}");
-            bytes
-        };
-        Ok(Box::new(CachedResponse::new(url, bytes)) as Box<dyn SuccessResponse>)
-    })
-}
-
 fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -271,13 +249,9 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
             .as_ref()
             .map(|url| url.to_string())
             .unwrap_or_else(|_| request.url().to_string());
-        let patch_book = request.method() == NavigationMethod::Get
-            && request.body().is_none()
-            && resolved.is_ok_and(|url| crate::book_fonts::applies(&url));
         let (source, future) = self.fetch_original(request);
         tracing::info!(target: "moleruffle_core::net", id, source = source.as_str(), "Fetch start {url}");
         let started = Instant::now();
-        let future = if patch_book { patch_book_response(future) } else { future };
         Box::pin(async move {
             let result = future.await;
             let elapsed_ms = started.elapsed().as_millis() as u64;

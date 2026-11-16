@@ -29,7 +29,6 @@ use url::Url;
 pub mod cache;
 pub use cache::{CachingNavigator, cache_dir};
 pub mod mem;
-mod book_fonts;
 mod simsun_compat;
 
 /// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
@@ -335,17 +334,10 @@ impl MoleUiBackend {
 
 impl UiBackend for MoleUiBackend {
     fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
-        // Book aliases are introduced only in selected book responses. Ordinary
-        // UI font names keep the fallback policy used before the book fixes.
-        if let Some(families) = book_fonts::families(&query.name) {
-            for family in families {
-                if self.try_register(family, query, register) {
-                    return;
-                }
-            }
-        }
+        // 文本框可能用嵌入字体的名字(如 "Arial_14pt_st")却以设备字体渲染,先去掉尺寸后缀。
+        let family = simsun_compat::base_family(&query.name);
         // SimSun / 宋体(游戏九成以上的文本框):用行高与 SimSun 一致的字体,避免固定文本框溢出。
-        if simsun_compat::is_simsun(&query.name) {
+        if simsun_compat::is_simsun(family) {
             for family in simsun_compat::SYSTEM_FAMILIES {
                 if self.try_register(family, query, register) {
                     tracing::info!("字体 '{}' 用 SimSun 相容字体 '{}'", query.name, family);
@@ -365,10 +357,11 @@ impl UiBackend for MoleUiBackend {
             }
         }
         // Flash dynamically creates Latin-named fields containing Chinese.
-        if ["Times New Roman", "Times", "Arial", "Helvetica", "Tahoma", "Verdana"]
-            .iter().any(|name| query.name.eq_ignore_ascii_case(name))
+        // Heiti TC 的行高与 SimSun 相同(1.00 em),优先于 PingFang TC(1.40 em)。
+        if ["Times New Roman", "Times", "Arial", "Helvetica", "Tahoma", "Verdana", "_sans"]
+            .iter().any(|name| family.eq_ignore_ascii_case(name))
         {
-            for family in ["PingFang TC", "Microsoft JhengHei", "Noto Sans CJK TC"] {
+            for family in ["Heiti TC", "PingFang TC", "Microsoft JhengHei", "Noto Sans CJK TC"] {
                 if self.try_register(family, query, register) { return; }
             }
         }
