@@ -18,7 +18,7 @@ use ruffle_core::backend::ui::{
     MultiDialogResultFuture, UiBackend,
 };
 use ruffle_core::config::Letterbox;
-use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
+use ruffle_core::font::{DefaultFont, FontFileData, FontQuery, FontType};
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, StageScaleMode};
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
@@ -241,6 +241,8 @@ pub struct MoleUiBackend {
     visibility_handler: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     mouse_visible: bool,
     fonts: Arc<fontdb::Database>,
+    /// 已读入的系统字体文件,按 fontdb 面 ID 共用,避免同一个几十 MB 的 .ttc 每次登录都复制一份。
+    face_data: Arc<std::sync::Mutex<std::collections::HashMap<fontdb::ID, Arc<Vec<u8>>>>>,
     /// 应用内剪贴板兜底(移动端无系统剪贴板时用;桌面也作镜像)。
     clip: Arc<std::sync::Mutex<String>>,
     /// 是否需要弹出软键盘:Flash 文本框聚焦时引擎调 open_virtual_keyboard 置 true,
@@ -272,6 +274,7 @@ impl MoleUiBackend {
             visibility_handler: None,
             mouse_visible: true,
             fonts: Arc::new(db),
+            face_data: Default::default(),
             clip: Arc::new(std::sync::Mutex::new(String::new())),
             kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -299,6 +302,17 @@ impl MoleUiBackend {
         query: &FontQuery,
         register: &mut dyn FnMut(FontDefinition),
     ) -> bool {
+        self.try_register_as(family, &query.name, query, register)
+    }
+
+    /// 在系统字体库找 `family`,找到就以 `name` 这个名字注册给 Ruffle。
+    fn try_register_as(
+        &self,
+        family: &str,
+        name: &str,
+        query: &FontQuery,
+        register: &mut dyn FnMut(FontDefinition),
+    ) -> bool {
         let q = fontdb::Query {
             families: &[fontdb::Family::Name(family)],
             weight: if query.is_bold {
@@ -316,19 +330,43 @@ impl MoleUiBackend {
         let Some(id) = self.fonts.query(&q) else {
             return false;
         };
-        let def = self.fonts.with_face_data(id, |data, index| FontDefinition::FontFile {
-            name: query.name.clone(),
+        let Some((data, index)) = self.face_data(id) else {
+            return false;
+        };
+        register(FontDefinition::FontFile {
+            name: name.to_owned(),
             is_bold: query.is_bold,
             is_italic: query.is_italic,
-            data: FontFileData::new(data.to_vec()),
+            data: FontFileData::new_shared(data),
             index,
         });
-        if let Some(def) = def {
-            register(def);
-            true
-        } else {
-            false
+        true
+    }
+
+    fn face_data(&self, id: fontdb::ID) -> Option<(Arc<dyn AsRef<[u8]>>, u32)> {
+        let index = self.fonts.face(id)?.index;
+        let mut cache = self.face_data.lock().ok()?;
+        if let Some(data) = cache.get(&id) {
+            return Some((data.clone(), index));
         }
+        let data = Arc::new(self.fonts.with_face_data(id, |data, _| data.to_vec())?);
+        cache.insert(id, data.clone());
+        Some((data, index))
+    }
+}
+
+/// 英文名字型里的中文要退到哪些字型(依序)。`None` = 不是这类字型。
+/// 主字型用真正的英文字型(行高也照它),中文字形由这里的字型补上,与 Windows 的字型链接相同。
+fn latin_cjk_fallbacks(family: &str) -> Option<&'static [&'static str]> {
+    const SANS: &[&str] = &["Heiti TC", "PingFang TC", "Microsoft JhengHei", "Noto Sans CJK TC"];
+    const SERIF: &[&str] = &["SimSong", "STSong", "Songti TC", "Noto Serif CJK TC"];
+    let is = |names: &[&str]| names.iter().any(|n| family.eq_ignore_ascii_case(n));
+    if is(&["Arial", "Helvetica", "Tahoma", "Verdana"]) {
+        Some(SANS)
+    } else if is(&["Times New Roman", "Times"]) {
+        Some(SERIF)
+    } else {
+        None
     }
 }
 
@@ -451,12 +489,47 @@ impl UiBackend for MoleUiBackend {
     fn display_root_movie_download_failed_message(&self, _invalid_swf: bool, _fetch_error: String) {}
     fn message(&self, _message: &str) {}
     fn display_unsupported_video(&self, _url: Url) {}
+    /// 英文名字型(Arial、Tahoma、Times New Roman…):主字型用系统里真正的英文字型,
+    /// 中文找不到的字形再退到中文字型。行高由主字型决定,与 Windows 上 Flash 的表现一致。
+    /// 其他字体名回传空清单,Ruffle 会改走 `load_device_font`(单一字型)。
     fn sort_device_fonts(
         &self,
-        _query: &FontQuery,
-        _register: &mut dyn FnMut(FontDefinition),
+        query: &FontQuery,
+        register: &mut dyn FnMut(FontDefinition),
     ) -> Vec<FontQuery> {
-        Vec::new()
+        let family = simsun_compat::base_family(&query.name);
+        let Some(fallbacks) = latin_cjk_fallbacks(family) else {
+            return Vec::new();
+        };
+        if !self.try_register_as(family, &query.name, query, register) {
+            return Vec::new();
+        }
+        let sorted_query = |name: String| FontQuery::new(FontType::Device, name, query.is_bold, query.is_italic);
+        let mut sorted = vec![sorted_query(query.name.clone())];
+        let cjk = fallbacks.iter().copied().find(|fallback| {
+            let name = format!("MoleRuffle CJK: {fallback}");
+            self.try_register_as(fallback, &name, query, register)
+                .then(|| sorted.push(sorted_query(name)))
+                .is_some()
+        });
+        if cjk.is_none() {
+            let name = "MoleRuffle CJK: bundled".to_owned();
+            register(FontDefinition::FontFile {
+                name: name.clone(),
+                is_bold: query.is_bold,
+                is_italic: query.is_italic,
+                data: FontFileData::new(BUNDLED_FONT),
+                index: 0,
+            });
+            sorted.push(sorted_query(name));
+        }
+        tracing::info!(
+            "字体 '{}' 用 '{}',中文退到 '{}'",
+            query.name,
+            family,
+            cjk.unwrap_or("打包字体")
+        );
+        sorted
     }
     fn open_virtual_keyboard(&self) {
         // Flash 文本框聚焦:请求弹软键盘(平台壳轮询 keyboard_flag 去 set_ime_allowed)
@@ -555,5 +628,42 @@ mod ios_clipboard {
             let ns = NSString::from_str(text);
             pb.setString(Some(&ns));
         }
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    #[test]
+    fn latin_names_choose_matching_cjk_style() {
+        assert_eq!(latin_cjk_fallbacks("Arial").unwrap()[0], "Heiti TC");
+        assert_eq!(latin_cjk_fallbacks("tahoma").unwrap()[0], "Heiti TC");
+        assert_eq!(latin_cjk_fallbacks("Times New Roman").unwrap()[0], "SimSong");
+        assert!(latin_cjk_fallbacks("SimSun").is_none());
+        assert!(latin_cjk_fallbacks("Gulim").is_none());
+    }
+
+    /// 用这台 Mac 的真实系统字体:Arial 当主字型、中文退到黑体,且非英文名不走排序。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn latin_font_gets_real_font_plus_cjk_fallback() {
+        let ui = MoleUiBackend::with_system_fonts();
+        let query = FontQuery::new(FontType::Device, "Arial_14pt_st".into(), false, false);
+        let mut registered = Vec::new();
+        let sorted = ui.sort_device_fonts(&query, &mut |def| {
+            if let FontDefinition::FontFile { name, data, index, .. } = def {
+                let face = ttf_parser::Face::parse(&data, index).unwrap();
+                let has_cjk = face.glyph_index('書').is_some();
+                registered.push((name, has_cjk));
+            }
+        });
+        let names: Vec<_> = sorted.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(names, ["Arial_14pt_st", "MoleRuffle CJK: Heiti TC"]);
+        assert_eq!(registered[0], ("Arial_14pt_st".to_owned(), false), "main font is the real Arial");
+        assert!(registered[1].1, "fallback has Chinese glyphs");
+
+        let simsun = FontQuery::new(FontType::Device, "SimSun".into(), false, false);
+        assert!(ui.sort_device_fonts(&simsun, &mut |_| {}).is_empty());
     }
 }
