@@ -1752,6 +1752,8 @@ impl<'gc> MovieClip<'gc> {
         }
         let hit_target_frame = self.0.current_frame() == frame;
 
+        // MoleRuffle 补丁:倒带时被拿掉的时间轴物件(深度, 原本在显示清单的位置)。
+        let mut rewound_slots: SmallVec<[(Depth, usize); 4]> = SmallVec::new();
         if is_rewind {
             // Remove all display objects that were created after the
             // destination frame.
@@ -1773,6 +1775,13 @@ impl<'gc> MovieClip<'gc> {
 
             for child in children {
                 if !child.placed_by_avm2_script() {
+                    // MoleRuffle 补丁:记住它在显示清单里的位置,同一深度重新放置时放回原位。
+                    if let Some(index) = self
+                        .iter_render_list()
+                        .position(|x| DisplayObject::ptr_eq(x, child))
+                    {
+                        rewound_slots.push((child.depth(), index));
+                    }
                     self.remove_child(context, child);
                 } else {
                     self.remove_child_from_depth_list(context, child);
@@ -1880,6 +1889,20 @@ impl<'gc> MovieClip<'gc> {
             .iter()
             .filter(|params| params.frame >= frame)
             .for_each(|goto| run_goto_command(self, context, goto));
+
+        // MoleRuffle 补丁:倒带后在同一深度重新放置的时间轴物件,Ruffle 若上面没有别的时间轴物件,
+        // 会把它放到显示清单最上层,盖住脚本加入的子物件(例如阳光牧场卖东西时,滑鼠移出后
+        // 格子背景盖住农产品图示)。Flash 中它维持在原来的位置,所以移回去。
+        for (depth, index) in rewound_slots {
+            if let Some(child) = self.child_by_depth(depth) {
+                let moved = self
+                    .raw_container_mut(context.gc())
+                    .restore_rewound_position(child, index);
+                if moved {
+                    self.invalidate_cached_bitmap();
+                }
+            }
+        }
 
         if !is_implicit {
             // On AVM2, all explicit gotos act the same way as a normal new frame,

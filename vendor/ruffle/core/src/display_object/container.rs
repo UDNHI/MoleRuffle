@@ -1159,6 +1159,31 @@ impl<'gc> ChildContainer<'gc> {
     fn render_list_mut(&mut self) -> &mut Vec<DisplayObject<'gc>> {
         Rc::make_mut(&mut self.render_list)
     }
+
+    /// MoleRuffle 补丁:把倒带时重新放置的时间轴物件移回原本的位置。
+    ///
+    /// 只有在它和目标位置之间全是脚本加入的子物件时才移动(也就是它被错误地疊到这些子物件上面),
+    /// 其他情况不动。传回是否有移动。
+    pub fn restore_rewound_position(&mut self, child: DisplayObject<'gc>, index: usize) -> bool {
+        let Some(position) = self
+            .render_list
+            .iter()
+            .position(|x| DisplayObject::ptr_eq(*x, child))
+        else {
+            return false;
+        };
+        if position <= index
+            || !self.render_list[index..position]
+                .iter()
+                .all(|x| x.placed_by_avm2_script())
+        {
+            return false;
+        }
+        let list = self.render_list_mut();
+        let child = list.remove(position);
+        list.insert(index, child);
+        true
+    }
 }
 
 pub struct RenderIter<'gc> {
