@@ -13,7 +13,21 @@ App 採本機簽章，尚未經 Apple 公證。
 ## 已知問題
 
 - 拜訪別人餐廳後返回自己餐廳，服務生可能在端菜時消失。
-- 《伊蓮小理財》的文字排版尚未處理。
+- 長時間待在餐廳，記憶體會持續增加，玩久了可能變慢；建議不時重開遊戲。
+- 家具等遊戲從不卸載的資源會隨遊玩時間慢慢累積。
+
+## 開發
+
+需要 Rust 與 Java（建置 Ruffle 的 ActionScript 內建類別時使用，macOS 可用 `brew install openjdk`）。
+
+```sh
+cargo build --release
+```
+
+打包 macOS App 用 `packaging/macos/package.py`。
+
+- 引擎固定在 Ruffle `304a3c9`；其中 `ruffle_core` 使用 `vendor/ruffle` 的修補版，改動說明見 [PATCHES.md](vendor/ruffle/PATCHES.md)。
+- 程式架構見 [架構說明](docs/ARCHITECTURE.md)。
 
 ## 版本紀錄
 

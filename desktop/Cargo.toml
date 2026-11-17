@@ -27,6 +27,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+# 接收 Ruffle 的 PlayerNotification(输入法游标位置等),与 ruffle_core 用的版本一致。
+async-channel = "2"
 
 # iOS:纯触摸复制粘贴工具条(原生 UIView 叠层)。版本对齐 winit 已用的 objc2 0.5.2 套。
 [target.'cfg(target_os = "ios")'.dependencies]

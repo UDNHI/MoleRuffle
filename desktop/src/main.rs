@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ruffle_core::backend::navigator::{OwnedFuture, SocketMode};
-use ruffle_core::events::{ImeEvent, MouseButton as RuffleButton, MouseWheelDelta};
+use ruffle_core::events::{
+    ImeCursorArea, ImeEvent, ImeNotification, ImePurpose, MouseButton as RuffleButton,
+    MouseWheelDelta, PlayerNotification,
+};
 use ruffle_core::{FloatDuration, Player, PlayerBuilder, PlayerEvent};
 use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
 use ruffle_frontend_utils::backends::navigator::{ExternalNavigatorBackend, FutureSpawner};
@@ -88,6 +91,15 @@ struct App {
     /// 软键盘请求标志(来自 MoleUiBackend)+ 当前是否已开启,用于按需 set_ime_allowed。
     kbd: Option<Arc<AtomicBool>>,
     kbd_on: bool,
+    /// 触控板捲动累积的逻辑像素。Flash 的 MouseEvent.delta 是整数,
+    /// 小数行数会被游戏截成 0,所以凑满一行才送出。
+    scroll_px: f64,
+    /// Ruffle 的通知(文字框聚焦时的输入法游标位置等)。
+    notifications: Option<async_channel::Receiver<PlayerNotification>>,
+    /// 游戏要求的全萤幕状态,在 about_to_wait 放开 Player 锁后套用。
+    fullscreen_request: Option<Arc<mole::FullscreenRequest>>,
+    /// 上次看到的视窗是否全萤幕,用来侦测使用者自己离开全萤幕。
+    window_fullscreen: bool,
     /// iOS 纯触摸复制/粘贴工具条(文本框聚焦时显示)。
     #[cfg(target_os = "ios")]
     textbar: Option<ios_textbar::TextBar>,
@@ -98,6 +110,38 @@ struct App {
     /// iOS 绿色调试 HUD(左上角实时 FPS/内存/网络/渲染API/内核/温度)。
     #[cfg(target_os = "ios")]
     hud: Option<ios_debug_hud::DebugHud>,
+}
+
+/// 触控板捲动多少逻辑像素算一行。
+const TRACKPAD_PIXELS_PER_LINE: f64 = 20.0;
+
+/// 把累积的触控板位移(逻辑像素)换成整数行数,回传 (行数, 剩下的像素)。
+fn trackpad_lines(accumulated_px: f64) -> (f64, f64) {
+    let lines = (accumulated_px / TRACKPAD_PIXELS_PER_LINE).trunc();
+    (lines, accumulated_px - lines * TRACKPAD_PIXELS_PER_LINE)
+}
+
+/// 舞台座标的范围 → 视窗物理像素 (x, y, 宽, 高)。
+/// `view_matrix` 把舞台对应到 viewport(含 ShowAll 的缩放与黑边);viewport 是物理像素 × RENDER_SCALE。
+fn stage_area_to_window(view_matrix: &ruffle_render::matrix::Matrix, area: &ImeCursorArea) -> (f64, f64, f64, f64) {
+    let (a, d) = (view_matrix.a as f64, view_matrix.d as f64);
+    let (tx, ty) = (view_matrix.tx.to_pixels(), view_matrix.ty.to_pixels());
+    (
+        (a * area.x + tx) / RENDER_SCALE,
+        (d * area.y + ty) / RENDER_SCALE,
+        a * area.width / RENDER_SCALE,
+        d * area.height / RENDER_SCALE,
+    )
+}
+
+/// `App::build_player` 的结果。
+struct BuiltPlayer {
+    player: Arc<Mutex<Player>>,
+    /// 软键盘请求标志。
+    kbd: Arc<AtomicBool>,
+    render_api: String,
+    notifications: async_channel::Receiver<PlayerNotification>,
+    fullscreen_request: Arc<mole::FullscreenRequest>,
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -150,6 +194,10 @@ fn log_slow_ui_work(phase: &'static str, started: Instant) {
 const MEM_SOFT_FLOOR_MB: u64 = 1500;
 #[cfg(target_os = "ios")]
 const MEM_URGENT_MB: u64 = 700;
+
+/// 桌面端记录内存足迹的间隔。
+#[cfg(not(target_os = "ios"))]
+const MEM_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
 /// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
@@ -206,6 +254,10 @@ impl App {
             viewport: (0, 0),
             kbd: None,
             kbd_on: false,
+            scroll_px: 0.0,
+            notifications: None,
+            fullscreen_request: None,
+            window_fullscreen: false,
             #[cfg(target_os = "ios")]
             textbar: None,
             render_api: String::from("?"),
@@ -215,7 +267,7 @@ impl App {
         })
     }
 
-    fn build_player(&self, window: Arc<Window>) -> (Arc<Mutex<Player>>, Arc<AtomicBool>, String) {
+    fn build_player(&self, window: Arc<Window>) -> BuiltPlayer {
         // 渲染尺寸用 render_dims(iOS 已 ×RENDER_SCALE 降采样,省显存避免 jetsam)
         let (width, height) = render_dims(&window);
 
@@ -329,10 +381,13 @@ impl App {
             move |visible| visibility_window.set_cursor_visible(visible),
         );
         let kbd = ui.keyboard_flag();
+        let fullscreen_request = ui.fullscreen_request();
+        let (notification_sender, notifications) = async_channel::unbounded();
         let mut builder = PlayerBuilder::new()
             .with_renderer(renderer)
             .with_navigator(navigator)
-            .with_ui(ui);
+            .with_ui(ui)
+            .with_notification_sender(notification_sender);
         match CpalAudioBackend::new(None) {
             Ok(audio) => builder = builder.with_audio(audio),
             Err(e) => tracing::warn!("无音频后端: {e}"),
@@ -354,7 +409,84 @@ impl App {
             mole::set_mole_fonts(&mut p);
             p.fetch_root_movie(mole::GAME_SWF_URL.to_string(), vec![], Box::new(|_| {}));
         }
-        (player, kbd, render_api)
+        BuiltPlayer { player, kbd, render_api, notifications, fullscreen_request }
+    }
+
+    /// 快速退出:先隐藏窗口、把 SharedObject(“记住账号”等)写盘、在 UI 线程取消本地任务,
+    /// 然后直接结束进程,由操作系统一次回收内存。
+    ///
+    /// 不再 drop Player:玩得越久 Player 里累积的对象越多,逐个析构会让关窗卡住
+    /// (实测 25 分钟 ≈ 11 秒、54 分钟 ≈ 76 秒)。Player 的 Drop 本来只额外做
+    /// `flush_shared_objects`,这里已手动调用。
+    ///
+    /// `executor.shutdown()` 仍在 UI 线程执行,保证 !Send future 在所属线程上 drop(v0.1.7 的修正)。
+    fn quit_now(&mut self) -> ! {
+        if let Some(w) = &self.window {
+            w.set_visible(false);
+        }
+
+        let started = Instant::now();
+        self.with_player(|p| p.flush_shared_objects());
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "SharedObjects flushed");
+
+        let started = Instant::now();
+        self.executor.shutdown();
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Local tasks cancelled; exiting");
+
+        std::process::exit(0);
+    }
+
+    /// 把游戏要求的全萤幕状态套用到视窗(此时没有持有 Player 锁)。
+    #[cfg(not(target_os = "ios"))]
+    fn apply_fullscreen_request(&mut self) {
+        let Some(full) = self.fullscreen_request.as_ref().and_then(|request| request.take()) else {
+            return;
+        };
+        if let Some(w) = &self.window {
+            if window_is_fullscreen(w) != full {
+                tracing::info!("游戏要求{}全萤幕", if full { "进入" } else { "离开" });
+                set_window_fullscreen(w, full);
+            }
+        }
+    }
+
+    /// 处理 Ruffle 的通知:文字框聚焦时,把输入法选字框移到文字框下方。
+    fn handle_player_notifications(&mut self) {
+        let Some(notifications) = self.notifications.clone() else {
+            return;
+        };
+        while let Ok(notification) = notifications.try_recv() {
+            let PlayerNotification::ImeNotification(notification) = notification;
+            match notification {
+                ImeNotification::ImeReady { purpose, cursor_area } => {
+                    if let Some(w) = &self.window {
+                        w.set_ime_purpose(match purpose {
+                            ImePurpose::Standard => winit::window::ImePurpose::Normal,
+                            ImePurpose::Password => winit::window::ImePurpose::Password,
+                        });
+                    }
+                    self.set_ime_cursor_area(&cursor_area);
+                }
+                ImeNotification::ImeCursorAreaUpdated(cursor_area) => self.set_ime_cursor_area(&cursor_area),
+                ImeNotification::ImePurposeUpdated(_) | ImeNotification::ImeNotReady => {}
+            }
+        }
+    }
+
+    /// Ruffle 给的是文字框在舞台座标(像素)的范围;经舞台的缩放与黑边位移换成视窗物理像素。
+    fn set_ime_cursor_area(&self, area: &ImeCursorArea) {
+        let Some(w) = &self.window else {
+            return;
+        };
+        let Some(matrix) = self.with_player(|p| p.mutate_with_update_context(|ctx| ctx.stage.view_matrix()))
+        else {
+            return;
+        };
+        let (x, y, width, height) = stage_area_to_window(&matrix, area);
+        w.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(x, y),
+            winit::dpi::PhysicalSize::new(width, height),
+        );
     }
 
     fn with_player<R>(&self, f: impl FnOnce(&mut Player) -> R) -> Option<R> {
@@ -454,7 +586,8 @@ impl ApplicationHandler<UserEvent> for App {
             sz.height,
             window.scale_factor()
         );
-        let (player, kbd, render_api) = self.build_player(window.clone());
+        let BuiltPlayer { player, kbd, render_api, notifications, fullscreen_request } =
+            self.build_player(window.clone());
         self.render_api = render_api;
         window.request_redraw();
         // iOS:创建纯触摸复制/粘贴工具条(挂到 UIView,初始隐藏)+ 绿色调试 HUD(挂到 UIView,常显)
@@ -472,6 +605,8 @@ impl ApplicationHandler<UserEvent> for App {
         self.window = Some(window);
         self.player = Some(player);
         self.kbd = Some(kbd);
+        self.notifications = Some(notifications);
+        self.fullscreen_request = Some(fullscreen_request);
         self.last_tick = Instant::now();
         // Poll:让 about_to_wait 持续触发去 request_redraw,
         // 渲染只在 RedrawRequested 里做(iOS 要求渲染在 RedrawRequested 阶段)。
@@ -495,14 +630,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         enter_runtime!(self);
         match event {
             WindowEvent::CloseRequested => {
-                tracing::info!("Window close requested; cancelling local tasks on UI thread");
-                self.executor.shutdown();
-                self.player.take();
-                el.exit();
+                tracing::info!("Window close requested");
+                self.quit_now();
             }
             WindowEvent::Resized(_size) => {
                 // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 render_dims(已降采样)。
@@ -515,12 +648,19 @@ impl ApplicationHandler<UserEvent> for App {
                         "Resized: render={}x{} (inner={}x{}) scale={}",
                         width, height, inner.width, inner.height, scale
                     );
+                    // 使用者用 Esc、绿色按钮等方式离开全萤幕时,把游戏的 displayState 也改回一般。
+                    let fullscreen = window_is_fullscreen(w);
+                    let left_fullscreen = self.window_fullscreen && !fullscreen;
+                    self.window_fullscreen = fullscreen;
                     self.with_player(|p| {
                         p.set_viewport_dimensions(ViewportDimensions {
                             width,
                             height,
                             scale_factor: scale,
-                        })
+                        });
+                        if left_fullscreen && p.is_fullscreen() {
+                            p.set_fullscreen(false);
+                        }
                     });
                     w.request_redraw();
                 }
@@ -643,21 +783,58 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.with_player(|p| p.handle_event(ev));
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 let lines = match delta {
+                    // 滑鼠滚轮:一格就是一行。
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
-                    MouseScrollDelta::PixelDelta(p) => p.y / 100.0,
+                    // 触控板:像素位移累积到满一行才送,送整数行,余数留到下次。
+                    MouseScrollDelta::PixelDelta(p) => {
+                        if phase == TouchPhase::Started {
+                            self.scroll_px = 0.0;
+                        }
+                        let scale = self.window.as_ref().map_or(1.0, |w| w.scale_factor());
+                        let (lines, rest) = trackpad_lines(self.scroll_px + p.y / scale);
+                        self.scroll_px = rest;
+                        lines
+                    }
                 };
-                self.with_player(|p| {
-                    p.handle_event(PlayerEvent::MouseWheel {
-                        delta: MouseWheelDelta::Lines(lines),
-                    })
-                });
+                if lines != 0.0 {
+                    self.with_player(|p| {
+                        p.handle_event(PlayerEvent::MouseWheel {
+                            delta: MouseWheelDelta::Lines(lines),
+                        })
+                    });
+                }
             }
             WindowEvent::ModifiersChanged(new) => {
                 self.modifiers = new;
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // 跟 Flash Player 一样,按 Esc 离开全萤幕(游戏要求的,或绿色按钮进入的都算);
+                // 这一下 Esc 不再传给游戏。
+                #[cfg(not(target_os = "ios"))]
+                if event.state == ElementState::Pressed
+                    && event.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                {
+                    let window_full = self.window.as_ref().is_some_and(|w| window_is_fullscreen(w));
+                    let mut game_full = false;
+                    self.with_player(|p| {
+                        game_full = p.is_fullscreen();
+                        if game_full {
+                            p.set_fullscreen(false);
+                        }
+                    });
+                    if window_full || game_full {
+                        tracing::info!("按 Esc 离开全萤幕");
+                        if let Some(fullscreen_request) = &self.fullscreen_request {
+                            fullscreen_request.take();
+                        }
+                        if let Some(w) = &self.window {
+                            set_window_fullscreen(w, false);
+                        }
+                        return;
+                    }
+                }
                 let key = keymap::winit_input_to_ruffle_key_descriptor(&event);
                 let modifiers = self.modifiers;
                 self.with_player(|p| match event.state {
@@ -696,8 +873,8 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
         enter_runtime!(self);
-        self.executor.shutdown();
-        self.player.take();
+        // 例如 macOS 的 Cmd+Q:同样走快速退出,不在主线程逐个析构 Player。
+        self.quit_now();
     }
 
     // 锁帧驱动:推进 tokio 异步 + 按 SWF 帧率 tick + 仅脏时请求重绘 + 睡到下一帧(渲染在 RedrawRequested 做)
@@ -730,6 +907,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
+        #[cfg(not(target_os = "ios"))]
+        self.apply_fullscreen_request();
+        self.handle_player_notifications();
         // iOS:UIPasteControl 授权投递后,这里发一次 TextControl::Paste 让 Ruffle 取 clipboard_content
         #[cfg(target_os = "ios")]
         if mole::paste_bridge::take_pending() {
@@ -772,6 +952,41 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // 桌面端内存观测:每 30 秒记一笔 phys_footprint,用来看长时间游玩时内存怎么涨。
+        // 同时记录还活着的 SWF 数量(Ruffle 的 Library 以弱引用登记载入过的 SWF,
+        // 被释放的会自动消失),以及其中重复最多的网址,用来判断旧的 SWF 有没有被释放。
+        #[cfg(not(target_os = "ios"))]
+        if self.last_mem_check.elapsed() >= MEM_LOG_INTERVAL {
+            self.last_mem_check = now;
+            let movies = self.with_player(|p| {
+                p.mutate_with_update_context(|ctx| {
+                    let mut counts = std::collections::HashMap::<String, usize>::new();
+                    let mut released = 0usize;
+                    for movie in ctx.library.known_movies() {
+                        if ctx.library.is_movie_released(&movie) {
+                            released += 1;
+                            continue;
+                        }
+                        let url = movie.url();
+                        let path = url.split('?').next().unwrap_or(url);
+                        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                        *counts.entry(name).or_default() += 1;
+                    }
+                    let total: usize = counts.values().sum();
+                    let mut top: Vec<_> = counts.into_iter().collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1));
+                    top.truncate(5);
+                    let top = top.iter().map(|(n, c)| format!("{n}×{c}")).collect::<Vec<_>>().join(" ");
+                    (total, released, top)
+                })
+            });
+            if let Some(mb) = mole::mem::footprint_mb() {
+                let (live_swfs, released_swfs, top_swfs) = movies.unwrap_or_default();
+                tracing::info!(footprint_mb = mb, frames = self.frames, live_swfs, released_swfs, top_swfs,
+                    "Memory footprint");
+            }
+        }
+
         // 睡到下一 SWF 帧(或被输入/异步事件提前唤醒),替代原来的 Poll 满速空转。
         el.set_control_flow(ControlFlow::WaitUntil(now + til));
     }
@@ -788,6 +1003,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     tracing::info!("MoleRuffle 桌面端启动,加载 {}", mole::GAME_SWF_URL);
+    mole::logs::prune_old_logs();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -800,4 +1016,73 @@ fn main() -> anyhow::Result<()> {
     }
     result?;
     Ok(())
+}
+
+/// 视窗是否处于全萤幕(macOS 的原生全萤幕或同桌面的「简易全萤幕」)。
+#[cfg(not(target_os = "ios"))]
+fn window_is_fullscreen(w: &Window) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowExtMacOS;
+        if w.simple_fullscreen() {
+            return true;
+        }
+    }
+    w.fullscreen().is_some()
+}
+
+/// 进入或离开全萤幕。macOS 上用「简易全萤幕」,留在同一个桌面(跟 Flash Player 一样),
+/// 不会像绿色按钮那样另开一个桌面空间。
+#[cfg(not(target_os = "ios"))]
+fn set_window_fullscreen(w: &Window, full: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::WindowExtMacOS;
+        if w.fullscreen().is_some() {
+            // 绿色按钮进入的原生全萤幕:只能用原生方式离开。
+            if !full {
+                w.set_fullscreen(None);
+            }
+            return;
+        }
+        w.set_simple_fullscreen(full);
+    }
+    #[cfg(not(target_os = "macos"))]
+    w.set_fullscreen(full.then_some(winit::window::Fullscreen::Borderless(None)));
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn trackpad_scroll_sends_whole_lines_and_keeps_the_rest() {
+        assert_eq!(trackpad_lines(5.0), (0.0, 5.0));
+        assert_eq!(trackpad_lines(45.0), (2.0, 5.0));
+        assert_eq!(trackpad_lines(-45.0), (-2.0, -5.0));
+        // 小位移累积起来终究会送出一行。
+        let mut rest = 0.0;
+        let mut sent = 0.0;
+        for _ in 0..10 {
+            let (lines, r) = trackpad_lines(rest + 3.0);
+            sent += lines;
+            rest = r;
+        }
+        assert_eq!((sent, rest), (1.0, 10.0));
+    }
+
+    #[test]
+    fn ime_area_follows_stage_scale_and_letterbox() {
+        use ruffle_render::matrix::Matrix;
+        use ruffle_core::swf::Twips;
+        // 舞台放大 2 倍、左侧黑边 100 像素。
+        let matrix = Matrix {
+            a: 2.0,
+            d: 2.0,
+            tx: Twips::from_pixels(100.0),
+            ..Matrix::IDENTITY
+        };
+        let area = ImeCursorArea { x: 10.0, y: 20.0, width: 30.0, height: 40.0 };
+        assert_eq!(stage_area_to_window(&matrix, &area), (120.0, 40.0, 60.0, 80.0));
+    }
 }

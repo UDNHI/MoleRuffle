@@ -6,6 +6,8 @@ members = [
     "crates/moleruffle-core",
     "desktop",
 ]
+# vendor/ruffle 是另一个独立的 workspace(ruffle_core 的本地修补版),不属于本 workspace。
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -36,6 +38,11 @@ anyhow = "1.0"
 # 各平台标准数据目录(桌面=各自数据目录;iOS=沙盒内 Library/Application Support,
 # 重启/更新保留)。用于 SharedObject(“记住账号”等)磁盘持久化。
 dirs = "6"
+
+# ruffle_core 改用本地修补版(同一个 rev 304a3c9 + 卸载时释放 SWF 的补丁,见 vendor/ruffle/PATCHES.md)。
+# 其余 Ruffle crate 照旧从官方仓库取得;它们对 ruffle_core 的依赖也会一并换成这份。
+[patch."https://github.com/ruffle-rs/ruffle"]
+ruffle_core = { path = "vendor/ruffle/core" }
 
 [profile.release]
 # 引擎是 AVM 解释器,优化等级对手机帧率影响大

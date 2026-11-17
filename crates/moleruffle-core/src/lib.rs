@@ -18,7 +18,7 @@ use ruffle_core::backend::ui::{
     MultiDialogResultFuture, UiBackend,
 };
 use ruffle_core::config::Letterbox;
-use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
+use ruffle_core::font::{DefaultFont, FontFileData, FontQuery, FontType};
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, StageScaleMode};
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
@@ -28,8 +28,9 @@ use url::Url;
 
 pub mod cache;
 pub use cache::{CachingNavigator, cache_dir};
+pub mod logs;
 pub mod mem;
-mod book_fonts;
+mod simsun_compat;
 
 /// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
 /// 相对路径(version/、resource/、config/、dll/)都相对它来解析。
@@ -180,23 +181,35 @@ pub fn set_mole_fonts(player: &mut Player) {
 ///
 /// - `confirm_socket`:一律放行(等价桌面版 `--tcp-connections allow`),
 ///   让游戏能裸 TCP 连 `123.206.131.236:1865` / `:3200` 等服务器。
-/// - `navigate_to_website`:外链(充值页等),本基础实现先只记日志;
-///   桌面壳可覆盖为打开系统浏览器。
-/// - `open_file`:本地文件,这里直接走 std(本客户端基本不需要)。
+/// - `navigate_to_website`:外链(充值页等)用系统预设浏览器开启(macOS);
+///   只接受 http/https,且每秒最多开一次,避免被窜改的内容乱开网页。
+/// - `open_file`:一律拒绝。游戏内容从明文 HTTP 载入,若被篡改就能借 `file://` 读本机任意档案
+///   再传出去;而本客户端主程式与资源都从网路载入,银行补丁由 [`cache`] 自己读档,用不到这条路。
 #[derive(Clone, Default)]
 pub struct MoleNavigatorInterface;
 
 impl NavigatorInterface for MoleNavigatorInterface {
     fn navigate_to_website(&self, url: Url) {
-        tracing::info!("navigate_to_website(忽略): {url}");
+        if !matches!(url.scheme(), "http" | "https") {
+            tracing::warn!("拒绝开启非网页连结: {url}");
+            return;
+        }
+        if !external_link_allowed(std::time::Instant::now()) {
+            tracing::warn!("连结开得太频繁,略过: {url}");
+            return;
+        }
+        open_in_browser(&url);
     }
 
     fn open_file(
         &self,
         path: &Path,
     ) -> impl std::future::Future<Output = io::Result<std::fs::File>> + Send {
-        let path = path.to_path_buf();
-        async move { std::fs::File::open(path) }
+        tracing::warn!("拒绝游戏内容读取本机档案: {}", path.display());
+        std::future::ready(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "MoleRuffle 不允许游戏内容读取本机档案",
+        )))
     }
 
     fn confirm_socket(
@@ -207,6 +220,34 @@ impl NavigatorInterface for MoleNavigatorInterface {
         tracing::info!("放行 socket: {host}:{port}");
         async move { true }
     }
+}
+
+/// 外部连结的最短间隔。游戏内容走明文 HTTP,不让它短时间内连开一堆网页。
+const EXTERNAL_LINK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn external_link_allowed(now: std::time::Instant) -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return false;
+    };
+    if last.is_some_and(|last| now.saturating_duration_since(last) < EXTERNAL_LINK_INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_browser(url: &Url) {
+    tracing::info!("用浏览器开启: {url}");
+    if let Err(e) = std::process::Command::new("/usr/bin/open").arg(url.as_str()).spawn() {
+        tracing::warn!("无法开启浏览器: {e}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_in_browser(url: &Url) {
+    tracing::info!("此平台尚未支援开启外部连结,略过: {url}");
 }
 
 /// 设备字体回退顺序:任何字体名都先试精确匹配,失败再依次退到这些
@@ -241,11 +282,43 @@ pub struct MoleUiBackend {
     visibility_handler: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     mouse_visible: bool,
     fonts: Arc<fontdb::Database>,
+    /// 已读入的系统字体文件,按 fontdb 面 ID 共用,避免同一个几十 MB 的 .ttc 每次登录都复制一份。
+    face_data: Arc<std::sync::Mutex<std::collections::HashMap<fontdb::ID, Arc<Vec<u8>>>>>,
     /// 应用内剪贴板兜底(移动端无系统剪贴板时用;桌面也作镜像)。
     clip: Arc<std::sync::Mutex<String>>,
     /// 是否需要弹出软键盘:Flash 文本框聚焦时引擎调 open_virtual_keyboard 置 true,
     /// 失焦置 false。平台壳轮询此标志去 set_ime_allowed(显示/隐藏 iOS 软键盘)。
     kbd: Arc<std::sync::atomic::AtomicBool>,
+    /// 游戏要求的全萤幕状态(见 [`FullscreenRequest`]),由平台壳在放开 Player 锁之后套用到视窗。
+    fullscreen: Arc<FullscreenRequest>,
+}
+
+/// 游戏(`stage.displayState`)要求进入或离开全萤幕。
+///
+/// `UiBackend::set_fullscreen` 是在 Player 更新途中、持有 Player 锁时被呼叫的;
+/// 直接改视窗大小可能马上触发 Resized 事件,而事件处理又要锁 Player,会互锁。
+/// 所以这里只记下请求,由平台壳在事件回圈空闲时 [`take`](Self::take) 后套用。
+#[derive(Default)]
+pub struct FullscreenRequest(std::sync::atomic::AtomicU8);
+
+impl FullscreenRequest {
+    const NONE: u8 = 0;
+    const ENTER: u8 = 1;
+    const EXIT: u8 = 2;
+
+    fn request(&self, full: bool) {
+        let value = if full { Self::ENTER } else { Self::EXIT };
+        self.0.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 取出尚未处理的请求:`Some(true)` 进入、`Some(false)` 离开、`None` 没有请求。
+    pub fn take(&self) -> Option<bool> {
+        match self.0.swap(Self::NONE, std::sync::atomic::Ordering::Relaxed) {
+            Self::ENTER => Some(true),
+            Self::EXIT => Some(false),
+            _ => None,
+        }
+    }
 }
 
 impl MoleUiBackend {
@@ -272,8 +345,10 @@ impl MoleUiBackend {
             visibility_handler: None,
             mouse_visible: true,
             fonts: Arc::new(db),
+            face_data: Default::default(),
             clip: Arc::new(std::sync::Mutex::new(String::new())),
             kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fullscreen: Default::default(),
         }
     }
 
@@ -293,9 +368,25 @@ impl MoleUiBackend {
         self.kbd.clone()
     }
 
+    /// 平台壳取这个物件,在事件回圈空闲时套用游戏要求的全萤幕状态。
+    pub fn fullscreen_request(&self) -> Arc<FullscreenRequest> {
+        self.fullscreen.clone()
+    }
+
     fn try_register(
         &self,
         family: &str,
+        query: &FontQuery,
+        register: &mut dyn FnMut(FontDefinition),
+    ) -> bool {
+        self.try_register_as(family, &query.name, query, register)
+    }
+
+    /// 在系统字体库找 `family`,找到就以 `name` 这个名字注册给 Ruffle。
+    fn try_register_as(
+        &self,
+        family: &str,
+        name: &str,
         query: &FontQuery,
         register: &mut dyn FnMut(FontDefinition),
     ) -> bool {
@@ -316,39 +407,66 @@ impl MoleUiBackend {
         let Some(id) = self.fonts.query(&q) else {
             return false;
         };
-        let def = self.fonts.with_face_data(id, |data, index| FontDefinition::FontFile {
-            name: query.name.clone(),
+        let Some((data, index)) = self.face_data(id) else {
+            return false;
+        };
+        register(FontDefinition::FontFile {
+            name: name.to_owned(),
             is_bold: query.is_bold,
             is_italic: query.is_italic,
-            data: FontFileData::new(data.to_vec()),
+            data: FontFileData::new_shared(data),
             index,
         });
-        if let Some(def) = def {
-            register(def);
-            true
-        } else {
-            false
-        }
+        true
     }
+
+    fn face_data(&self, id: fontdb::ID) -> Option<(Arc<dyn AsRef<[u8]>>, u32)> {
+        let index = self.fonts.face(id)?.index;
+        let mut cache = self.face_data.lock().ok()?;
+        if let Some(data) = cache.get(&id) {
+            return Some((data.clone(), index));
+        }
+        let data = Arc::new(self.fonts.with_face_data(id, |data, _| data.to_vec())?);
+        cache.insert(id, data.clone());
+        Some((data, index))
+    }
+}
+
+/// 英文名字型里的中文要退到哪些字型(依序)。`None` = 不是这类字型。
+/// 主字型用真正的英文字型(行高也照它),中文字形由这里的字型补上,与 Windows 的字型链接相同。
+/// 游戏原本在简体中文 Windows 上制作,那里 Arial/Tahoma 的中文会链接到 SimSun,
+/// 所以一律退到宋体,书里“宋体框”和“Arial 框”的中文才会一致(如《伊蓮小理財》)。
+fn latin_cjk_fallbacks(family: &str) -> Option<&'static [&'static str]> {
+    const SONG: &[&str] = &["SimSong", "STSong", "Songti TC", "Noto Serif CJK TC"];
+    ["Arial", "Helvetica", "Tahoma", "Verdana", "Times New Roman", "Times"]
+        .iter()
+        .any(|n| family.eq_ignore_ascii_case(n))
+        .then_some(SONG)
 }
 
 impl UiBackend for MoleUiBackend {
     fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
-        // Book aliases are introduced only in selected book responses. Ordinary
-        // UI font names keep the fallback policy used before the book fixes.
-        if let Some(families) = book_fonts::families(&query.name) {
-            for family in families {
+        // 文本框可能用嵌入字体的名字(如 "Arial_14pt_st")却以设备字体渲染,先去掉尺寸后缀。
+        let family = simsun_compat::base_family(&query.name);
+        // SimSun / 宋体(游戏九成以上的文本框):用行高与 SimSun 一致的字体,避免固定文本框溢出。
+        // 英文名字型(Arial…)一般走 `sort_device_fonts`;系统没有该英文字型时才到这里,同样用宋体。
+        if simsun_compat::is_simsun(family) || latin_cjk_fallbacks(family).is_some() {
+            for family in simsun_compat::SYSTEM_FAMILIES {
                 if self.try_register(family, query, register) {
+                    tracing::info!("字体 '{}' 用 SimSun 相容字体 '{}'", query.name, family);
                     return;
                 }
             }
-        }
-        // Flash dynamically creates Latin-named fields containing Chinese.
-        if ["Times New Roman", "Times", "Arial", "Helvetica", "Tahoma", "Verdana"]
-            .iter().any(|name| query.name.eq_ignore_ascii_case(name))
-        {
-            for family in ["PingFang TC", "Microsoft JhengHei", "Noto Sans CJK TC"] {
-                if self.try_register(family, query, register) { return; }
+            if let Some(data) = simsun_compat::bundled(BUNDLED_FONT) {
+                register(FontDefinition::FontFile {
+                    name: query.name.clone(),
+                    is_bold: query.is_bold,
+                    is_italic: query.is_italic,
+                    data: FontFileData::new(data),
+                    index: 0,
+                });
+                tracing::info!("字体 '{}' 用改成 SimSun 行高的打包字体", query.name);
+                return;
             }
         }
         // 1) 先按游戏请求的确切字体名找
@@ -431,18 +549,55 @@ impl UiBackend for MoleUiBackend {
             *s = content;
         }
     }
-    fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), FullscreenError> {
+    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError> {
+        // 只记下请求,平台壳放开 Player 锁后再改视窗(见 FullscreenRequest)。
+        self.fullscreen.request(is_full);
         Ok(())
     }
     fn display_root_movie_download_failed_message(&self, _invalid_swf: bool, _fetch_error: String) {}
     fn message(&self, _message: &str) {}
     fn display_unsupported_video(&self, _url: Url) {}
+    /// 英文名字型(Arial、Tahoma、Times New Roman…):主字型用系统里真正的英文字型,
+    /// 中文找不到的字形再退到中文字型。行高由主字型决定,与 Windows 上 Flash 的表现一致。
+    /// 其他字体名回传空清单,Ruffle 会改走 `load_device_font`(单一字型)。
     fn sort_device_fonts(
         &self,
-        _query: &FontQuery,
-        _register: &mut dyn FnMut(FontDefinition),
+        query: &FontQuery,
+        register: &mut dyn FnMut(FontDefinition),
     ) -> Vec<FontQuery> {
-        Vec::new()
+        let family = simsun_compat::base_family(&query.name);
+        let Some(fallbacks) = latin_cjk_fallbacks(family) else {
+            return Vec::new();
+        };
+        if !self.try_register_as(family, &query.name, query, register) {
+            return Vec::new();
+        }
+        let sorted_query = |name: String| FontQuery::new(FontType::Device, name, query.is_bold, query.is_italic);
+        let mut sorted = vec![sorted_query(query.name.clone())];
+        let cjk = fallbacks.iter().copied().find(|fallback| {
+            let name = format!("MoleRuffle CJK: {fallback}");
+            self.try_register_as(fallback, &name, query, register)
+                .then(|| sorted.push(sorted_query(name)))
+                .is_some()
+        });
+        if cjk.is_none() {
+            let name = "MoleRuffle CJK: bundled".to_owned();
+            register(FontDefinition::FontFile {
+                name: name.clone(),
+                is_bold: query.is_bold,
+                is_italic: query.is_italic,
+                data: FontFileData::new(BUNDLED_FONT),
+                index: 0,
+            });
+            sorted.push(sorted_query(name));
+        }
+        tracing::info!(
+            "字体 '{}' 用 '{}',中文退到 '{}'",
+            query.name,
+            family,
+            cjk.unwrap_or("打包字体")
+        );
+        sorted
     }
     fn open_virtual_keyboard(&self) {
         // Flash 文本框聚焦:请求弹软键盘(平台壳轮询 keyboard_flag 去 set_ime_allowed)
@@ -541,5 +696,69 @@ mod ios_clipboard {
             let ns = NSString::from_str(text);
             pb.setString(Some(&ns));
         }
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    #[test]
+    fn latin_names_choose_matching_cjk_style() {
+        assert_eq!(latin_cjk_fallbacks("Arial").unwrap()[0], "SimSong");
+        assert_eq!(latin_cjk_fallbacks("tahoma").unwrap()[0], "SimSong");
+        assert_eq!(latin_cjk_fallbacks("Times New Roman").unwrap()[0], "SimSong");
+        assert!(latin_cjk_fallbacks("SimSun").is_none());
+        assert!(latin_cjk_fallbacks("Gulim").is_none());
+    }
+
+    /// 用这台 Mac 的真实系统字体:Arial 当主字型、中文退到 SimSong,且非英文名不走排序。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn latin_font_gets_real_font_plus_cjk_fallback() {
+        let ui = MoleUiBackend::with_system_fonts();
+        let query = FontQuery::new(FontType::Device, "Arial_14pt_st".into(), false, false);
+        let mut registered = Vec::new();
+        let sorted = ui.sort_device_fonts(&query, &mut |def| {
+            if let FontDefinition::FontFile { name, data, index, .. } = def {
+                let face = ttf_parser::Face::parse(&data, index).unwrap();
+                let has_cjk = face.glyph_index('書').is_some();
+                registered.push((name, has_cjk));
+            }
+        });
+        let names: Vec<_> = sorted.iter().map(|q| q.name.as_str()).collect();
+        assert_eq!(names, ["Arial_14pt_st", "MoleRuffle CJK: SimSong"]);
+        assert_eq!(registered[0], ("Arial_14pt_st".to_owned(), false), "main font is the real Arial");
+        assert!(registered[1].1, "fallback has Chinese glyphs");
+
+        let simsun = FontQuery::new(FontType::Device, "SimSun".into(), false, false);
+        assert!(ui.sort_device_fonts(&simsun, &mut |_| {}).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod navigator_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn local_files_are_never_opened() {
+        // 即使档案确实存在也要拒绝。
+        let path = std::env::current_exe().unwrap();
+        let mut future = pin!(MoleNavigatorInterface.open_file(&path));
+        let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("open_file should finish immediately");
+        };
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn external_links_are_rate_limited() {
+        let start = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(external_link_allowed(start));
+        assert!(!external_link_allowed(start + std::time::Duration::from_millis(500)));
+        assert!(external_link_allowed(start + std::time::Duration::from_millis(1100)));
     }
 }

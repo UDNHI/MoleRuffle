@@ -17,3 +17,10 @@ DerivedData/
 
 # xcodegen 生成的工程(可由 ios/project.yml 重新生成)
 ios/MoleRuffle.xcodeproj/
+
+# Local test packages, game caches and scratch work
+/outputs/
+/work/
+*.app/
+*.swfcache
+__pycache__/
