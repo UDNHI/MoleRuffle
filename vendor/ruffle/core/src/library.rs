@@ -113,6 +113,25 @@ impl<'gc> Avm2ClassRegistry<'gc> {
         }
         self.class_map.insert(class_def, MovieSymbol(movie, symbol));
     }
+
+    /// MoleRuffle 补丁:忘掉与该影片符号关联的所有类别。
+    /// 类别会经由 TranslationUnit 强引用影片,不清掉的话影片永远不会被释放。
+    fn release_movie(&mut self, movie: &Arc<SwfMovie>) {
+        self.class_map
+            .retain(|_, MovieSymbol(symbol_movie, _)| !Arc::ptr_eq(&symbol_movie, movie));
+    }
+}
+
+/// [`Library::release_movie`] 的结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// 已释放影片的符号库。
+    Released,
+    /// 影片的 AVM2 网域与其他影片共用(载入到 currentDomain 等),
+    /// 其类别可能在卸载后仍被使用,所以保留。
+    SharedDomain,
+    /// 没有这部影片的符号库(已释放过或从未建立)。
+    NotFound,
 }
 
 /// Symbol library for a single given SWF.
@@ -126,6 +145,8 @@ pub struct MovieLibrary<'gc> {
     jpeg_tables: Option<Vec<u8>>,
     fonts: FontMap<'gc>,
     avm2_domain: Option<Avm2Domain<'gc>>,
+    /// MoleRuffle 补丁:已被 [`Library::release_movie`] 清空。
+    released: bool,
 }
 
 impl<'gc> MovieLibrary<'gc> {
@@ -138,7 +159,19 @@ impl<'gc> MovieLibrary<'gc> {
             jpeg_tables: None,
             fonts: Default::default(),
             avm2_domain: None,
+            released: false,
         }
+    }
+
+    /// MoleRuffle 补丁:丢掉角色(位图、形状、文字…连同 GPU 资源)、汇出符号与字体,
+    /// 只留下影片本身与 AVM2 网域,让仍在跑的旧剪辑查得到符号库而不会崩溃。
+    fn strip(&mut self) {
+        self.characters = HashMap::new();
+        self.imported_assets = HashMap::new();
+        self.export_characters = Avm1PropertyMap::new();
+        self.jpeg_tables = None;
+        self.fonts = Default::default();
+        self.released = true;
     }
 
     /// Registers a character; returns `true` if successful, or `false` if a character with
@@ -421,6 +454,10 @@ impl<'gc> MovieLibraries<'gc> {
     fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
         self.0.keys()
     }
+
+    fn get_mut(&mut self, movie: &Arc<SwfMovie>) -> Option<&mut MovieLibrary<'gc>> {
+        self.0.get_mut(movie)
+    }
 }
 
 /// Symbol library for multiple movies.
@@ -480,6 +517,47 @@ impl<'gc> Library<'gc> {
 
     pub fn known_movies(&self) -> impl Iterator<Item = Arc<SwfMovie>> {
         self.movie_libraries.known_movies()
+    }
+
+    /// MoleRuffle 补丁(移植自 ruffle-rs/ruffle#24918):释放被 `Loader.unload`/`unloadAndStop`
+    /// 卸载的影片的符号库。
+    ///
+    /// 符号库原本会活到播放器结束:它强引用影片本身、影片定义的每个角色(连同形状与位图
+    /// 的 GPU 资源)以及绑定到其符号的 AVM2 类别。释放后,一旦不再有显示对象或脚本引用这部
+    /// 影片,垃圾回收器就能把这些全部收回。
+    ///
+    /// 仍存活的、由这部影片建立的对象保有已拿到的东西,但无法再从它建立新的符号实例。
+    /// 为了不弄坏「载入素材 SWF 到共用网域、卸载 Loader、之后继续用它的类别」的常见写法,
+    /// 网域与其他影片共用时不释放。
+    ///
+    /// 与上游 PR 不同:这个 Ruffle 版本有许多地方假设影片的符号库一定存在(直接 unwrap,
+    /// 或查不到就建一个空的,之后取网域时崩溃),而卸载后的旧剪辑仍可能跑帧脚本。
+    /// 所以不删除登记,只清空占记忆体的内容,保留影片与网域。
+    /// MoleRuffle 补丁:这部影片的符号库是否已被 [`Self::release_movie`] 清空(观测用)。
+    pub fn is_movie_released(&self, movie: &Arc<SwfMovie>) -> bool {
+        self.movie_libraries.get(movie).is_some_and(|library| library.released)
+    }
+
+    pub fn release_movie(&mut self, movie: &Arc<SwfMovie>) -> ReleaseOutcome {
+        let Some(library) = self.movie_libraries.get(movie) else {
+            return ReleaseOutcome::NotFound;
+        };
+        if library.released {
+            return ReleaseOutcome::NotFound;
+        }
+        if let Some(domain) = library.try_avm2_domain() {
+            let shared = self.movie_libraries.0.iter().any(|(other, library)| {
+                !Arc::ptr_eq(&other, movie) && library.try_avm2_domain() == Some(domain)
+            });
+            if shared {
+                return ReleaseOutcome::SharedDomain;
+            }
+        }
+        self.avm2_class_registry.release_movie(movie);
+        if let Some(library) = self.movie_libraries.get_mut(movie) {
+            library.strip();
+        }
+        ReleaseOutcome::Released
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)

@@ -89,6 +89,9 @@ pub struct UpdateContext<'gc> {
     /// Requests that the player re-renders after this execution (e.g. due to `updateAfterEvent`).
     pub needs_render: &'gc mut bool,
 
+    /// MoleRuffle 补丁:要求本次更新后做一次完整垃圾回收(例如 `Loader.unloadAndStop(true)`)。
+    pub needs_gc: &'gc mut bool,
+
     /// The root SWF file.
     pub root_swf: &'gc mut Arc<SwfMovie>,
 

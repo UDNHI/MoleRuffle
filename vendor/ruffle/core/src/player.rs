@@ -308,6 +308,8 @@ pub struct Player {
 
     run_state: RunState,
     needs_render: bool,
+    /// MoleRuffle 补丁:见 `UpdateContext::needs_gc`。
+    needs_gc: bool,
 
     renderer: Box<dyn RenderBackend>,
     audio: Box<dyn AudioBackend>,
@@ -2291,6 +2293,7 @@ impl Player {
                 timers,
                 current_context_menu,
                 needs_render: &mut this.needs_render,
+                needs_gc: &mut this.needs_gc,
                 avm1,
                 avm2,
                 external_interface,
@@ -2383,6 +2386,17 @@ impl Player {
 
         // GC
         self.gc_arena.borrow_mut().collect_debt();
+        if std::mem::take(&mut self.needs_gc) {
+            // MoleRuffle 补丁(移植自 ruffle-rs/ruffle#24918):内容要求回收(`Loader.unloadAndStop(true)`)。
+            // 回收器按物件数量调节步调,卸载影片占的大量记忆体(资料、形状、位图)不计在内,
+            // 不强制的话要等一段无关的配置量才会释放。进行中的回收周期可能在卸载前就标记了
+            // 这些内容,所以先跑完它,再完整回收一次。
+            let mut arena = self.gc_arena.borrow_mut();
+            if arena.collection_phase() != gc_arena::arena::CollectionPhase::Sleeping {
+                arena.finish_cycle();
+            }
+            arena.finish_cycle();
+        }
 
         rval
     }
@@ -3040,6 +3054,7 @@ impl PlayerBuilder {
                     RunState::Suspended
                 },
                 needs_render: true,
+                needs_gc: false,
                 self_reference: self_ref.clone(),
                 load_behavior: self.load_behavior,
                 spoofed_url: self.spoofed_url.clone(),

@@ -14,7 +14,8 @@ use crate::avm2::object::LoaderStream;
 use crate::avm2::object::TObject as _;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
-use crate::avm2::{Error, Object};
+use crate::avm2::{Avm2, Error, Object};
+use crate::library::ReleaseOutcome;
 use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::display_object::LoaderDisplay;
@@ -307,7 +308,75 @@ pub fn unload<'gc>(
 
     let loader_info = loader_info.as_loader_info_object().unwrap();
 
-    loader_info.unload(activation.context);
+    unload_and_release(activation, loader_info, false);
 
     Ok(Value::Undefined)
+}
+
+/// MoleRuffle 补丁(移植自 ruffle-rs/ruffle#24918,并扩及 `unload`):
+/// 卸载后释放影片的符号库,否则每次载入的 SWF(连同位图、形状、类别)都永远留在记忆体里。
+pub fn unload_and_stop<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    this: Value<'gc>,
+    args: &[Value<'gc>],
+) -> Result<Value<'gc>, Error<'gc>> {
+    avm2_stub_method!(
+        activation,
+        "flash.display.Loader",
+        "unloadAndStop",
+        "stopping sounds, streams, timers and stage listeners"
+    );
+
+    let gc = args.get_bool(0);
+    let this = this.as_object().unwrap();
+
+    let loader_info = this
+        .get_slot(loader_slots::_CONTENT_LOADER_INFO)
+        .as_object()
+        .unwrap();
+
+    let loader_info = loader_info.as_loader_info_object().unwrap();
+
+    unload_and_release(activation, loader_info, gc);
+
+    Ok(Value::Undefined)
+}
+
+/// 卸载 Loader 的内容,停止该影片的帧事件广播,并释放它的符号库。
+/// `force_gc` 为真时(`unloadAndStop(true)`)本次更新结束后做一次完整垃圾回收。
+fn unload_and_release<'gc>(
+    activation: &mut Activation<'_, 'gc>,
+    loader_info: LoaderInfoObject<'gc>,
+    force_gc: bool,
+) {
+    let loaded_movie = match &*loader_info.loader_stream() {
+        LoaderStream::Swf(movie, _) => Some(movie.clone()),
+        LoaderStream::NotYetLoaded(..) => None,
+    };
+
+    loader_info.unload(activation.context);
+
+    let Some(movie) = loaded_movie else {
+        return;
+    };
+    if Arc::ptr_eq(&movie, activation.context.root_swf) {
+        return;
+    }
+    let outcome = activation.context.library.release_movie(&movie);
+    match outcome {
+        ReleaseOutcome::Released => {
+            Avm2::unregister_broadcast_listeners_of_movie(activation.context, &movie);
+            if force_gc {
+                *activation.context.needs_gc = true;
+            }
+        }
+        ReleaseOutcome::SharedDomain | ReleaseOutcome::NotFound => {}
+    }
+    tracing::info!(
+        target: "ruffle_core::unload",
+        outcome = ?outcome,
+        force_gc,
+        "Loader unloaded {}",
+        movie.url()
+    );
 }

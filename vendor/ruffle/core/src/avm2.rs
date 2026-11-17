@@ -396,6 +396,24 @@ impl<'gc> Avm2<'gc> {
         bucket.push(object.downgrade());
     }
 
+    /// MoleRuffle 补丁(移植自 ruffle-rs/ruffle#24918):停止对已卸载影片的显示对象广播
+    /// enterFrame/exitFrame/frameConstructed,如同 Flash Player 的 `Loader.unloadAndStop`。
+    /// 否则孤立的时间轴会一直收到这些事件,直到被回收为止。
+    pub fn unregister_broadcast_listeners_of_movie(
+        context: &mut UpdateContext<'gc>,
+        movie: &Arc<SwfMovie>,
+    ) {
+        let mc = context.gc_context;
+        for bucket in context.avm2.broadcast_list.values_mut() {
+            bucket.retain(|entry| match entry.upgrade(mc) {
+                Some(object) => !object
+                    .as_display_object()
+                    .is_some_and(|dobj| Arc::ptr_eq(&dobj.movie(), movie)),
+                None => false,
+            });
+        }
+    }
+
     /// Dispatch an event on all objects in the current execution list.
     ///
     /// `on_type` specifies a class or interface constructor whose instances,

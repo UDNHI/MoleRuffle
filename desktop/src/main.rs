@@ -799,11 +799,37 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         // 桌面端内存观测:每 30 秒记一笔 phys_footprint,用来看长时间游玩时内存怎么涨。
+        // 同时记录还活着的 SWF 数量(Ruffle 的 Library 以弱引用登记载入过的 SWF,
+        // 被释放的会自动消失),以及其中重复最多的网址,用来判断旧的 SWF 有没有被释放。
         #[cfg(not(target_os = "ios"))]
         if self.last_mem_check.elapsed() >= MEM_LOG_INTERVAL {
             self.last_mem_check = now;
+            let movies = self.with_player(|p| {
+                p.mutate_with_update_context(|ctx| {
+                    let mut counts = std::collections::HashMap::<String, usize>::new();
+                    let mut released = 0usize;
+                    for movie in ctx.library.known_movies() {
+                        if ctx.library.is_movie_released(&movie) {
+                            released += 1;
+                            continue;
+                        }
+                        let url = movie.url();
+                        let path = url.split('?').next().unwrap_or(url);
+                        let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                        *counts.entry(name).or_default() += 1;
+                    }
+                    let total: usize = counts.values().sum();
+                    let mut top: Vec<_> = counts.into_iter().collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1));
+                    top.truncate(5);
+                    let top = top.iter().map(|(n, c)| format!("{n}×{c}")).collect::<Vec<_>>().join(" ");
+                    (total, released, top)
+                })
+            });
             if let Some(mb) = mole::mem::footprint_mb() {
-                tracing::info!(footprint_mb = mb, frames = self.frames, "Memory footprint");
+                let (live_swfs, released_swfs, top_swfs) = movies.unwrap_or_default();
+                tracing::info!(footprint_mb = mb, frames = self.frames, live_swfs, released_swfs, top_swfs,
+                    "Memory footprint");
             }
         }
 

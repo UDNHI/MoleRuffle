@@ -30,10 +30,8 @@ package flash.display {
         public native function unload():void;
 
         [API("662")]
-        public function unloadAndStop(gc:Boolean = true):void {
-            stub_method("flash.display.Loader", "unloadAndStop");
-            this.unload();
-        }
+        // MoleRuffle 补丁:改为原生实现,卸载后释放影片(见 loader.rs 的 unload_and_stop)。
+        public native function unloadAndStop(gc:Boolean = true):void;
 
         public function close():void {
             stub_method("flash.display.Loader", "close");
