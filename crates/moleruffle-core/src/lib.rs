@@ -28,6 +28,7 @@ use url::Url;
 
 pub mod cache;
 pub use cache::{CachingNavigator, cache_dir};
+pub mod logs;
 pub mod mem;
 mod simsun_compat;
 

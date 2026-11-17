@@ -849,6 +849,7 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     tracing::info!("MoleRuffle 桌面端启动,加载 {}", mole::GAME_SWF_URL);
+    mole::logs::prune_old_logs();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
