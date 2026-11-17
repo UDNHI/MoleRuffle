@@ -16,8 +16,8 @@ p = argparse.ArgumentParser()
 for name in ['binary', 'bank-original', 'bank-patched', 'metadata', 'out']:
     p.add_argument('--' + name, required=True, type=Path)
 p.add_argument('--arch', choices=['arm64', 'x86_64'], default='arm64')
-p.add_argument('--version', default='0.1.9')
-p.add_argument('--build-version', default='2026102401')
+p.add_argument('--version', default='0.1.10')
+p.add_argument('--build-version', default='2026111701')
 a = p.parse_args()
 actual = subprocess.check_output(['lipo', '-archs', str(a.binary)], text=True).strip()
 if actual != a.arch:
@@ -50,12 +50,15 @@ notes = f'''{app_name} v{a.version}
 適用：{platform}
 
 本版更新
-- 台版連線、銀行入口、游標與中文字型相容性調整。
-- 改善書籍排版、關閉崩潰與餐廳卡頓。
+- 關閉視窗立即結束；書籍與介面中文字型恢復原版排版（含《伊蓮小理財》）。
+- 資源確實快取到本機，重複進場景更快。
+- 新天使園戰鬥正常顯示；陽光牧場賣農產品時圖示不再消失。
+- 注音選字框跟著文字框；觸控板捲動更順；外部連結用瀏覽器開啟；Esc 可離開全螢幕。
+- 禁止遊戲內容讀取本機檔案。
 
 已知問題
 - 拜訪別人餐廳後返回自己餐廳，服務生可能在端菜時消失。
-- 《伊蓮小理財》的排版尚未處理。
+- 長時間待在餐廳，記憶體會持續增加；建議不時重開遊戲。
 
 非官方客戶端，尚未經 Apple 公證。
 '''

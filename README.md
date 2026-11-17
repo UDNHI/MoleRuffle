@@ -2,7 +2,7 @@
 
 基於 [MoleRuffle](https://github.com/moleworld-dev/MoleRuffle) 與 [Ruffle](https://github.com/ruffle-rs/ruffle) 的非官方客戶端，讓 Apple Silicon（M 系列）Mac 連線遊玩台版摩爾莊園。
 
-目前版本：**v0.1.9**
+目前版本：**v0.1.10**
 
 ## 使用方式
 

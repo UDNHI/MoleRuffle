@@ -80,7 +80,8 @@ rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e"
 ```
 
 其中 `ruffle_core` 透過根目錄 `Cargo.toml` 的 `[patch]` 改用 `vendor/ruffle/core`：同一個 rev，
-加上「卸載的 SWF 確定不再使用後釋放其符號庫」的修補（Ruffle 原本會讓每個載入過的 SWF 永遠留在記憶體）。
+加上兩項修補：卸載的 SWF 確定不再使用後釋放其符號庫（Ruffle 原本會讓每個載入過的 SWF 永遠留在記憶體），
+以及剪輯倒帶時，時間軸物件不再疊到腳本加入的子物件上面。
 改了哪些地方、升級時怎麼處理，見 [vendor/ruffle/PATCHES.md](../vendor/ruffle/PATCHES.md)。
 
 升級引擎＝改 rev、重新複製並套用 `vendor/ruffle` 的修補、重測全部玩法、提交新的 `Cargo.lock`。
