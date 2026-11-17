@@ -182,7 +182,8 @@ pub fn set_mole_fonts(player: &mut Player) {
 ///   让游戏能裸 TCP 连 `123.206.131.236:1865` / `:3200` 等服务器。
 /// - `navigate_to_website`:外链(充值页等),本基础实现先只记日志;
 ///   桌面壳可覆盖为打开系统浏览器。
-/// - `open_file`:本地文件,这里直接走 std(本客户端基本不需要)。
+/// - `open_file`:一律拒绝。游戏内容从明文 HTTP 载入,若被篡改就能借 `file://` 读本机任意档案
+///   再传出去;而本客户端主程式与资源都从网路载入,银行补丁由 [`cache`] 自己读档,用不到这条路。
 #[derive(Clone, Default)]
 pub struct MoleNavigatorInterface;
 
@@ -195,8 +196,11 @@ impl NavigatorInterface for MoleNavigatorInterface {
         &self,
         path: &Path,
     ) -> impl std::future::Future<Output = io::Result<std::fs::File>> + Send {
-        let path = path.to_path_buf();
-        async move { std::fs::File::open(path) }
+        tracing::warn!("拒绝游戏内容读取本机档案: {}", path.display());
+        std::future::ready(Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "MoleRuffle 不允许游戏内容读取本机档案",
+        )))
     }
 
     fn confirm_socket(
@@ -654,5 +658,24 @@ mod font_tests {
 
         let simsun = FontQuery::new(FontType::Device, "SimSun".into(), false, false);
         assert!(ui.sort_device_fonts(&simsun, &mut |_| {}).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod navigator_tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    #[test]
+    fn local_files_are_never_opened() {
+        // 即使档案确实存在也要拒绝。
+        let path = std::env::current_exe().unwrap();
+        let mut future = pin!(MoleNavigatorInterface.open_file(&path));
+        let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            panic!("open_file should finish immediately");
+        };
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
     }
 }
