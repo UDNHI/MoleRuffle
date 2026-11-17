@@ -14,11 +14,14 @@ use crate::avm2::object::LoaderStream;
 use crate::avm2::object::TObject as _;
 use crate::avm2::parameters::ParametersExt;
 use crate::avm2::value::Value;
-use crate::avm2::{Avm2, Error, Object};
+use crate::avm2::{Error, Object};
 use crate::library::ReleaseOutcome;
 use crate::avm2_stub_method;
 use crate::backend::navigator::{NavigationMethod, Request};
 use crate::display_object::LoaderDisplay;
+use crate::display_object::{
+    DisplayObject, DisplayObjectWeak, TDisplayObject, TDisplayObjectContainer,
+};
 use crate::display_object::MovieClip;
 use crate::loader::LoadManager;
 use crate::loader::MovieLoaderVMData;
@@ -344,33 +347,48 @@ pub fn unload_and_stop<'gc>(
 
 /// 卸载 Loader 的内容,停止该影片的帧事件广播,并释放它的符号库。
 /// `force_gc` 为真时(`unloadAndStop(true)`)本次更新结束后做一次完整垃圾回收。
+/// 收集 `root` 与它底下所有可追踪(剪辑、Loader、位图)的显示物件的弱引用。
+fn collect_clips<'gc>(root: DisplayObject<'gc>) -> Vec<DisplayObjectWeak<'gc>> {
+    let mut clips = Vec::new();
+    let mut stack = vec![root];
+    while let Some(object) = stack.pop() {
+        match object {
+            DisplayObject::MovieClip(_)
+            | DisplayObject::LoaderDisplay(_)
+            | DisplayObject::Bitmap(_) => clips.push(object.downgrade()),
+            _ => {}
+        }
+        if let Some(container) = object.as_container() {
+            stack.extend(container.iter_render_list());
+        }
+    }
+    clips
+}
+
 fn unload_and_release<'gc>(
     activation: &mut Activation<'_, 'gc>,
     loader_info: LoaderInfoObject<'gc>,
     force_gc: bool,
 ) {
-    let loaded_movie = match &*loader_info.loader_stream() {
-        LoaderStream::Swf(movie, _) => Some(movie.clone()),
+    let loaded = match &*loader_info.loader_stream() {
+        LoaderStream::Swf(movie, root) => Some((movie.clone(), *root)),
         LoaderStream::NotYetLoaded(..) => None,
     };
 
     loader_info.unload(activation.context);
 
-    let Some(movie) = loaded_movie else {
+    let Some((movie, root)) = loaded else {
         return;
     };
     if Arc::ptr_eq(&movie, activation.context.root_swf) {
         return;
     }
-    let outcome = activation.context.library.release_movie(&movie);
-    match outcome {
-        ReleaseOutcome::Released => {
-            Avm2::unregister_broadcast_listeners_of_movie(activation.context, &movie);
-            if force_gc {
-                *activation.context.needs_gc = true;
-            }
-        }
-        ReleaseOutcome::SharedDomain | ReleaseOutcome::NotFound => {}
+    // 卸载当时的内容(根剪辑与它底下的剪辑)。游戏可能先把 loader.content 存起来,
+    // 卸载后才挂到画面上,所以等它们都被回收才清空符号库。
+    let clips = collect_clips(root);
+    let outcome = activation.context.library.queue_release(movie.clone(), clips);
+    if outcome == ReleaseOutcome::Pending && force_gc {
+        *activation.context.needs_gc = true;
     }
     tracing::info!(
         target: "ruffle_core::unload",

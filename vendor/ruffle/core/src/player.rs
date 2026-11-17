@@ -2398,6 +2398,21 @@ impl Player {
             arena.finish_cycle();
         }
 
+        // MoleRuffle 补丁:卸载后内容已被回收的影片,现在才清空符号库。
+        self.mutate_with_update_context(|context| {
+            if !context.library.has_pending_releases() {
+                return;
+            }
+            for movie in context.library.sweep_pending_releases(context.gc()) {
+                crate::avm2::Avm2::unregister_broadcast_listeners_of_movie(context, &movie);
+                tracing::info!(
+                    target: "ruffle_core::unload",
+                    "Released after content was collected {}",
+                    movie.url()
+                );
+            }
+        });
+
         rval
     }
 

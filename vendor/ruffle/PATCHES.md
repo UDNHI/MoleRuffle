@@ -21,13 +21,20 @@
 其中的角色與 AVM2 類別也都強引用影片，所以影片永遠不會被釋放，連同它的位圖、形狀（含 GPU 資源）。
 餐廳裡客人來來去去，5 分鐘就累積近 400 個 SWF、約 7 GB。官方回報：ruffle-rs/ruffle#24864。
 
-**做法**：移植 ruffle-rs/ruffle#24918（尚未合併），並做三點調整：
+**做法**：移植 ruffle-rs/ruffle#24918（尚未合併），並做五點調整：
 
 1. 除了 `Loader.unloadAndStop()`，一般的 `Loader.unload()` 也會釋放（遊戲兩者都用）。
    只有 `unloadAndStop(true)` 會在本次更新後強制完整垃圾回收。
 2. 影片的 AVM2 網域與其他影片共用時（例如載入到 `ApplicationDomain.currentDomain` 的素材庫）
    不釋放，避免「卸載後仍用它的類別建立物件」的寫法失效。
-3. **不刪除符號庫登記，只清空內容**（角色、匯出符號、字型、JPEG 表），保留影片與 AVM2 網域。
+3. 影片用 `SymbolClass` 把符號連結到類別時也不釋放。新天使園戰鬥會載入怪物、塔、技能 SWF，
+   先用 `getDefinition` 取出類別、立刻卸載，之後才建立物件；清空的話會出現
+   `Tried to instantiate non-registered character ID`，戰鬥場景畫不出來。
+4. **卸載時不立刻清空**：先記下當時的內容（根剪輯和底下的剪輯、位圖）的弱引用，
+   每次更新檢查一次，全部被垃圾回收後才清空（日誌 `Released after content was collected`）。
+   新天使園戰鬥地圖就是反例：地圖 SWF 載入後內容先被存起來、Loader 立刻卸載，
+   之後才掛到戰鬥圖層，子剪輯此時才從符號庫建立。立刻清空的話整張地圖畫不出來。
+5. **不刪除符號庫登記，只清空內容**（角色、匯出符號、字型、JPEG 表），保留影片與 AVM2 網域。
    上游 PR 是整筆刪除，但這個 Ruffle 版本有很多地方假設符號庫一定存在
    （`library_for_movie(..).unwrap()`，或 `library_for_movie_mut` 查不到就建空的、之後取網域時崩潰），
    而卸載後的舊剪輯仍可能跑幀腳本。整筆刪除的版本實測在餐廳約 1 分鐘就在
@@ -43,7 +50,7 @@
 - `src/avm2.rs`：`Avm2::unregister_broadcast_listeners_of_movie`。
 - `src/context.rs`、`src/player.rs`：`needs_gc` 旗標，在 `Player::update` 收尾時 `finish_cycle`。
 
-每次卸載會記一行 `ruffle_core::unload` 的 info 日誌（`Released` / `SharedDomain` / `NotFound`）。
+每次卸載會記一行 `ruffle_core::unload` 的 info 日誌（`Pending` / `SharedDomain` / `HasSymbolClasses` / `Untracked` / `NotFound`）。
 
 **已知限制**（與上游 PR 相同）：卸載後仍存活、由該影片建立的物件保有已拿到的東西，
 但無法再從它建立新的符號實例；`unloadAndStop` 停止聲音、串流、計時器與舞台監聽仍未實作。

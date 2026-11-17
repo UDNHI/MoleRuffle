@@ -3,7 +3,7 @@ use crate::avm2::{Class as Avm2Class, Domain as Avm2Domain};
 use crate::backend::audio::SoundHandle;
 use crate::character::Character;
 
-use crate::display_object::{Bitmap, Graphic, MorphShape, Text};
+use crate::display_object::{Bitmap, DisplayObjectWeak, Graphic, MorphShape, Text};
 use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
 use crate::prelude::*;
 use crate::string::AvmString;
@@ -116,6 +116,12 @@ impl<'gc> Avm2ClassRegistry<'gc> {
 
     /// MoleRuffle 补丁:忘掉与该影片符号关联的所有类别。
     /// 类别会经由 TranslationUnit 强引用影片,不清掉的话影片永远不会被释放。
+    fn has_movie(&self, movie: &Arc<SwfMovie>) -> bool {
+        self.class_map
+            .iter()
+            .any(|(_, MovieSymbol(symbol_movie, _))| Arc::ptr_eq(&symbol_movie, movie))
+    }
+
     fn release_movie(&mut self, movie: &Arc<SwfMovie>) {
         self.class_map
             .retain(|_, MovieSymbol(symbol_movie, _)| !Arc::ptr_eq(&symbol_movie, movie));
@@ -130,6 +136,14 @@ pub enum ReleaseOutcome {
     /// 影片的 AVM2 网域与其他影片共用(载入到 currentDomain 等),
     /// 其类别可能在卸载后仍被使用,所以保留。
     SharedDomain,
+    /// 影片以 SymbolClass 把符号连结到 AVM2 类别。游戏常先取出类别(getDefinition)
+    /// 再卸载 Loader,之后才 new 出来;清空的话图形会变空白,所以保留。
+    HasSymbolClasses,
+    /// 已排队:等卸载时的内容(根剪辑与当时的子剪辑)都被垃圾回收后才清空。
+    /// 游戏常把 `loader.content` 存起来,卸载后才挂到画面上(新天使园战斗地图)。
+    Pending,
+    /// 内容无法追踪(根不是剪辑),保留。
+    Untracked,
     /// 没有这部影片的符号库(已释放过或从未建立)。
     NotFound,
 }
@@ -460,6 +474,15 @@ impl<'gc> MovieLibraries<'gc> {
     }
 }
 
+/// MoleRuffle 补丁:等内容被回收后才清空的影片。
+#[derive(Collect)]
+#[collect(no_drop)]
+struct PendingRelease<'gc> {
+    #[collect(require_static)]
+    movie: Arc<SwfMovie>,
+    clips: Vec<DisplayObjectWeak<'gc>>,
+}
+
 /// Symbol library for multiple movies.
 #[derive(Collect)]
 #[collect(no_drop)]
@@ -491,6 +514,9 @@ pub struct Library<'gc> {
     /// A list of the symbols associated with specific AVM2 constructor
     /// prototypes.
     avm2_class_registry: Avm2ClassRegistry<'gc>,
+
+    /// MoleRuffle 补丁:见 [`Self::queue_release`]。
+    pending_releases: Vec<PendingRelease<'gc>>,
 }
 
 impl<'gc> Library<'gc> {
@@ -504,6 +530,7 @@ impl<'gc> Library<'gc> {
             default_font_names: Default::default(),
             default_font_cache: Default::default(),
             avm2_class_registry: Default::default(),
+            pending_releases: Vec::new(),
         }
     }
 
@@ -538,26 +565,81 @@ impl<'gc> Library<'gc> {
         self.movie_libraries.get(movie).is_some_and(|library| library.released)
     }
 
-    pub fn release_movie(&mut self, movie: &Arc<SwfMovie>) -> ReleaseOutcome {
+    /// 不能释放的原因;`None` 表示可以释放。
+    fn release_blocker(&self, movie: &Arc<SwfMovie>) -> Option<ReleaseOutcome> {
         let Some(library) = self.movie_libraries.get(movie) else {
-            return ReleaseOutcome::NotFound;
+            return Some(ReleaseOutcome::NotFound);
         };
         if library.released {
-            return ReleaseOutcome::NotFound;
+            return Some(ReleaseOutcome::NotFound);
         }
         if let Some(domain) = library.try_avm2_domain() {
             let shared = self.movie_libraries.0.iter().any(|(other, library)| {
                 !Arc::ptr_eq(&other, movie) && library.try_avm2_domain() == Some(domain)
             });
             if shared {
-                return ReleaseOutcome::SharedDomain;
+                return Some(ReleaseOutcome::SharedDomain);
             }
+        }
+        if self.avm2_class_registry.has_movie(movie) {
+            return Some(ReleaseOutcome::HasSymbolClasses);
+        }
+        None
+    }
+
+    fn release_movie(&mut self, movie: &Arc<SwfMovie>) -> ReleaseOutcome {
+        if let Some(blocker) = self.release_blocker(movie) {
+            return blocker;
         }
         self.avm2_class_registry.release_movie(movie);
         if let Some(library) = self.movie_libraries.get_mut(movie) {
             library.strip();
         }
         ReleaseOutcome::Released
+    }
+
+    /// MoleRuffle 补丁:Loader 卸载后,等 `clips`(卸载当时的内容)全部被回收才清空影片的符号库。
+    /// 卸载后游戏可能还拿着内容继续显示,它的子剪辑之后还要从符号库建立。
+    pub fn queue_release(
+        &mut self,
+        movie: Arc<SwfMovie>,
+        clips: Vec<DisplayObjectWeak<'gc>>,
+    ) -> ReleaseOutcome {
+        if let Some(blocker) = self.release_blocker(&movie) {
+            return blocker;
+        }
+        if clips.is_empty() {
+            return ReleaseOutcome::Untracked;
+        }
+        if let Some(pending) = self
+            .pending_releases
+            .iter_mut()
+            .find(|pending| Arc::ptr_eq(&pending.movie, &movie))
+        {
+            pending.clips.extend(clips);
+        } else {
+            self.pending_releases.push(PendingRelease { movie, clips });
+        }
+        ReleaseOutcome::Pending
+    }
+
+    pub fn has_pending_releases(&self) -> bool {
+        !self.pending_releases.is_empty()
+    }
+
+    /// 清空内容已全部被回收的排队影片,传回实际清空的影片。
+    pub fn sweep_pending_releases(&mut self, mc: &Mutation<'gc>) -> Vec<Arc<SwfMovie>> {
+        let mut dead = Vec::new();
+        self.pending_releases.retain(|pending| {
+            let alive = pending.clips.iter().any(|clip| clip.upgrade(mc).is_some());
+            if !alive {
+                dead.push(pending.movie.clone());
+            }
+            alive
+        });
+        dead.into_iter()
+            .filter(|movie| self.release_movie(movie) == ReleaseOutcome::Released)
+            .collect()
     }
 
     /// Returns the default Font implementations behind the built in names (ie `_sans`)
