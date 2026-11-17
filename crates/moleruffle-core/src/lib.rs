@@ -181,8 +181,8 @@ pub fn set_mole_fonts(player: &mut Player) {
 ///
 /// - `confirm_socket`:一律放行(等价桌面版 `--tcp-connections allow`),
 ///   让游戏能裸 TCP 连 `123.206.131.236:1865` / `:3200` 等服务器。
-/// - `navigate_to_website`:外链(充值页等),本基础实现先只记日志;
-///   桌面壳可覆盖为打开系统浏览器。
+/// - `navigate_to_website`:外链(充值页等)用系统预设浏览器开启(macOS);
+///   只接受 http/https,且每秒最多开一次,避免被窜改的内容乱开网页。
 /// - `open_file`:一律拒绝。游戏内容从明文 HTTP 载入,若被篡改就能借 `file://` 读本机任意档案
 ///   再传出去;而本客户端主程式与资源都从网路载入,银行补丁由 [`cache`] 自己读档,用不到这条路。
 #[derive(Clone, Default)]
@@ -190,7 +190,15 @@ pub struct MoleNavigatorInterface;
 
 impl NavigatorInterface for MoleNavigatorInterface {
     fn navigate_to_website(&self, url: Url) {
-        tracing::info!("navigate_to_website(忽略): {url}");
+        if !matches!(url.scheme(), "http" | "https") {
+            tracing::warn!("拒绝开启非网页连结: {url}");
+            return;
+        }
+        if !external_link_allowed(std::time::Instant::now()) {
+            tracing::warn!("连结开得太频繁,略过: {url}");
+            return;
+        }
+        open_in_browser(&url);
     }
 
     fn open_file(
@@ -212,6 +220,34 @@ impl NavigatorInterface for MoleNavigatorInterface {
         tracing::info!("放行 socket: {host}:{port}");
         async move { true }
     }
+}
+
+/// 外部连结的最短间隔。游戏内容走明文 HTTP,不让它短时间内连开一堆网页。
+const EXTERNAL_LINK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn external_link_allowed(now: std::time::Instant) -> bool {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return false;
+    };
+    if last.is_some_and(|last| now.saturating_duration_since(last) < EXTERNAL_LINK_INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+#[cfg(target_os = "macos")]
+fn open_in_browser(url: &Url) {
+    tracing::info!("用浏览器开启: {url}");
+    if let Err(e) = std::process::Command::new("/usr/bin/open").arg(url.as_str()).spawn() {
+        tracing::warn!("无法开启浏览器: {e}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_in_browser(url: &Url) {
+    tracing::info!("此平台尚未支援开启外部连结,略过: {url}");
 }
 
 /// 设备字体回退顺序:任何字体名都先试精确匹配,失败再依次退到这些
@@ -253,6 +289,36 @@ pub struct MoleUiBackend {
     /// 是否需要弹出软键盘:Flash 文本框聚焦时引擎调 open_virtual_keyboard 置 true,
     /// 失焦置 false。平台壳轮询此标志去 set_ime_allowed(显示/隐藏 iOS 软键盘)。
     kbd: Arc<std::sync::atomic::AtomicBool>,
+    /// 游戏要求的全萤幕状态(见 [`FullscreenRequest`]),由平台壳在放开 Player 锁之后套用到视窗。
+    fullscreen: Arc<FullscreenRequest>,
+}
+
+/// 游戏(`stage.displayState`)要求进入或离开全萤幕。
+///
+/// `UiBackend::set_fullscreen` 是在 Player 更新途中、持有 Player 锁时被呼叫的;
+/// 直接改视窗大小可能马上触发 Resized 事件,而事件处理又要锁 Player,会互锁。
+/// 所以这里只记下请求,由平台壳在事件回圈空闲时 [`take`](Self::take) 后套用。
+#[derive(Default)]
+pub struct FullscreenRequest(std::sync::atomic::AtomicU8);
+
+impl FullscreenRequest {
+    const NONE: u8 = 0;
+    const ENTER: u8 = 1;
+    const EXIT: u8 = 2;
+
+    fn request(&self, full: bool) {
+        let value = if full { Self::ENTER } else { Self::EXIT };
+        self.0.store(value, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 取出尚未处理的请求:`Some(true)` 进入、`Some(false)` 离开、`None` 没有请求。
+    pub fn take(&self) -> Option<bool> {
+        match self.0.swap(Self::NONE, std::sync::atomic::Ordering::Relaxed) {
+            Self::ENTER => Some(true),
+            Self::EXIT => Some(false),
+            _ => None,
+        }
+    }
 }
 
 impl MoleUiBackend {
@@ -282,6 +348,7 @@ impl MoleUiBackend {
             face_data: Default::default(),
             clip: Arc::new(std::sync::Mutex::new(String::new())),
             kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fullscreen: Default::default(),
         }
     }
 
@@ -299,6 +366,11 @@ impl MoleUiBackend {
     /// 平台壳取这个标志:为 true 时该弹软键盘(set_ime_allowed(true)),false 时收起。
     pub fn keyboard_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.kbd.clone()
+    }
+
+    /// 平台壳取这个物件,在事件回圈空闲时套用游戏要求的全萤幕状态。
+    pub fn fullscreen_request(&self) -> Arc<FullscreenRequest> {
+        self.fullscreen.clone()
     }
 
     fn try_register(
@@ -477,7 +549,9 @@ impl UiBackend for MoleUiBackend {
             *s = content;
         }
     }
-    fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), FullscreenError> {
+    fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError> {
+        // 只记下请求,平台壳放开 Player 锁后再改视窗(见 FullscreenRequest)。
+        self.fullscreen.request(is_full);
         Ok(())
     }
     fn display_root_movie_download_failed_message(&self, _invalid_swf: bool, _fetch_error: String) {}
@@ -678,5 +752,13 @@ mod navigator_tests {
             panic!("open_file should finish immediately");
         };
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn external_links_are_rate_limited() {
+        let start = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        assert!(external_link_allowed(start));
+        assert!(!external_link_allowed(start + std::time::Duration::from_millis(500)));
+        assert!(external_link_allowed(start + std::time::Duration::from_millis(1100)));
     }
 }

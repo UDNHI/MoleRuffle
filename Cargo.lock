@@ -2450,6 +2450,7 @@ name = "moleruffle-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "futures",
  "moleruffle-core",
  "objc2 0.5.2",
